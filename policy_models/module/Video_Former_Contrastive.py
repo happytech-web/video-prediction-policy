@@ -1,0 +1,695 @@
+# This code is referenced from https://github.com/dhansmair/flamingo-mini
+
+import torch
+from einops import rearrange, repeat
+from einops_exts import rearrange_many
+from torch import einsum, nn
+import torch.nn.functional as F
+from torch.nn.modules import loss
+
+from policy_models.module.transformers.utils import feed_forward_layer
+
+
+class Attention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        use_cross_attn=False,
+        y_dim=512,
+        qkv_bias: bool = False,
+        qk_norm: bool = False,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        norm_layer: nn.Module = nn.LayerNorm,
+        attn_mask=None,
+    ) -> None:
+        super().__init__()
+        assert dim % num_heads == 0, "dim should be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim**-0.5
+        self.fused_attn = True
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.attn_mask = attn_mask
+        self.use_cross_attn = use_cross_attn
+        if self.use_cross_attn:
+            # print('use_cross_attn')
+            self.y_kv = nn.Linear(y_dim, dim * 2, bias=qkv_bias)
+            self.y_k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+            self.gate = nn.Parameter(torch.zeros([self.num_heads]))
+
+    def forward(self, x: torch.Tensor, y=None) -> torch.Tensor:
+        B, N, C = x.shape
+        qkv = (
+            self.qkv(x)
+            .reshape(B, N, 3, self.num_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+        )
+        q, k, v = qkv.unbind(0)
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        if self.fused_attn:
+            if self.attn_mask is not None:
+                self.attn_mask = self.attn_mask.to(x.device)
+            x = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+                attn_mask=self.attn_mask,
+            )
+        else:
+            q = q * self.scale
+            attn = q @ k.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = attn @ v
+
+        if self.use_cross_attn:
+            # print('y_shape:',y.shape)
+            N_y = y.shape[1]
+            y_kv = (
+                self.y_kv(y)
+                .reshape(B, N_y, 2, self.num_heads, self.head_dim)
+                .permute(2, 0, 3, 1, 4)
+            )
+            y_k, y_v = y_kv.unbind(0)
+            y_k = self.y_k_norm(y_k)
+            y_out = F.scaled_dot_product_attention(
+                q,
+                y_k,
+                y_v,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+            )
+            # print('y_out_shape:', y_out.shape)
+            y_out = y_out * self.gate.tanh().view(1, -1, 1, 1)
+            x = x + y_out
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class PerceiverAttentionLayer(nn.Module):
+    """Perceiver Attention Layer"""
+
+    def __init__(self, dim: int, dim_head: int = 64, heads: int = 8):
+        super().__init__()
+        self.scale = dim_head**-0.5
+        self.heads = heads
+        self.dim_head = dim_head
+        inner_dim = dim_head * heads
+
+        # trainable components of PerceiverAttentionLayer
+        self.norm_media = nn.LayerNorm(dim)
+        self.norm_latents = nn.LayerNorm(dim)
+
+        self.to_q = nn.Linear(dim, inner_dim, bias=False)
+        self.to_k = nn.Linear(dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(dim, inner_dim, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim, bias=False)
+
+    def forward(self, features, latents):
+        """Latent vectors are cross-attending to the visual features x
+
+        Args:
+            features: Batch of visual features with shape (batch_size, n_features, dim)
+            latents: Latent learnt vectors which are used to compute queries with shape (batch_size, n_latents, dim)
+
+        Returns:
+            Attention score with shape (batch_size, n_latents, dim)
+        """
+        assert features.ndim == 3
+        assert latents.ndim == 3
+        assert features.shape[0] == latents.shape[0]
+        assert features.shape[2] == latents.shape[2]
+
+        n_heads = self.heads
+        n_batch, n_features, dim = features.shape
+        n_queries = latents.shape[1]
+
+        # Layer normalization
+        x = self.norm_media(features)
+        latents = self.norm_latents(latents)
+
+        # Compute the queries from the latents, for all attention heads simultaneously
+        q = self.to_q(latents)
+        q = rearrange(q, "b q (h d) -> b h q d", h=n_heads)
+        assert q.shape == torch.Size([n_batch, n_heads, n_queries, self.dim_head])
+
+        # Keys and values for all attention heads
+        kv_input = torch.cat((x, latents), dim=-2)
+        n_features_latents = n_features + n_queries
+        k = self.to_k(kv_input)
+        v = self.to_v(kv_input)
+
+        k, v = rearrange_many((k, v), "b f (h d) -> b h f d", h=n_heads)
+        assert v.shape == torch.Size(
+            [n_batch, n_heads, n_features_latents, self.dim_head]
+        )
+
+        q = q * self.scale
+
+        # Attention scores
+        sim = einsum("b h q d, b h f d -> b h q f", q, k)
+        sim = sim - sim.amax(dim=-1, keepdim=True).detach()
+        alphas = sim.softmax(dim=-1)
+
+        out = einsum("b h q f, b h f v -> b h q v", alphas, v)
+        out = rearrange(out, "b h q v -> b q (h v)")
+
+        return self.to_out(out)
+
+
+class TempAttentionLayer(nn.Module):
+    """Perceiver Attention Layer"""
+
+    def __init__(self, dim: int, dim_head: int = 64, heads: int = 8):
+        super().__init__()
+        self.scale = dim_head**-0.5
+        self.heads = heads
+        self.dim_head = dim_head
+        inner_dim = dim_head * heads
+
+        # trainable components of PerceiverAttentionLayer
+        self.norm_media = nn.LayerNorm(dim)
+
+        self.to_q = nn.Linear(dim, inner_dim, bias=False)
+        self.to_k = nn.Linear(dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(dim, inner_dim, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim, bias=False)
+
+    def forward(self, features):
+        """Latent vectors are cross-attending to the visual features x
+
+        Args:
+            features: Batch of visual features with shape (batch_size, n_features, dim)
+            latents: Latent learnt vectors which are used to compute queries with shape (batch_size, n_latents, dim)
+
+        Returns:
+            Attention score with shape (batch_size, n_latents, dim)
+        """
+        assert features.ndim == 3
+
+        n_heads = self.heads
+        n_batch, n_features, dim = features.shape
+        n_queries = features.shape[1]
+
+        # Layer normalization
+        x = self.norm_media(features)
+
+        # Compute the queries from the latents, for all attention heads simultaneously
+        q = self.to_q(x)
+        q = rearrange(q, "b q (h d) -> b h q d", h=n_heads)
+        assert q.shape == torch.Size([n_batch, n_heads, n_queries, self.dim_head])
+
+        # Keys and values for all attention heads
+        n_features_latents = n_features
+        k = self.to_k(x)
+        v = self.to_v(x)
+
+        k, v = rearrange_many((k, v), "b f (h d) -> b h f d", h=n_heads)
+        assert v.shape == torch.Size(
+            [n_batch, n_heads, n_features_latents, self.dim_head]
+        )
+
+        q = q * self.scale
+
+        # Attention scores
+        sim = einsum("b h q d, b h f d -> b h q f", q, k)
+        sim = sim - sim.amax(dim=-1, keepdim=True).detach()
+        alphas = sim.softmax(dim=-1)
+
+        out = einsum("b h q f, b h f v -> b h q v", alphas, v)
+        out = rearrange(out, "b h q v -> b q (h v)")
+
+        return self.to_out(out)
+
+
+###############################################
+#      contrastive learning utils             #
+###############################################
+
+
+def pdcp_L_contra(
+    z: torch.Tensor,
+    skill_id: torch.LongTensor,
+    tau: float = 0.07,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    NT-Xent contrastive loss
+    treats tasks sharing the same skill as positive
+    """
+    B, _ = z.shape
+    z = F.normalize(z, dim=-1)
+
+    sim = (z @ z.t()) / tau  # (B,B)
+    sim: torch.Tensor = sim - sim.max(dim=1, keepdim=True).values.detach()
+
+    eye = torch.eye(B, device=z.device, dtype=torch.bool)
+    pos_mask = (skill_id[:, None] == skill_id[None, :]) & (~eye)  # (B,B)
+
+    exp_sim = sim.exp()
+    denom = exp_sim.masked_fill(eye, 0.0).sum(dim=1)  # (B,)
+
+    log_prob = sim - torch.log(denom.unsqueeze(1) + eps)  # (B,B)
+
+    pos_cnt = pos_mask.sum(dim=1)
+    if not (pos_cnt > 0).any():
+        return torch.Tensor(0.0, device=z.device)
+
+    pos_log_sum = (log_prob * pos_mask.float()).sum(dim=1)
+    loss_per_i = -pos_log_sum / (pos_cnt + eps)  # (B,)
+
+    return loss_per_i.mean()
+
+
+def pdcp_L_proto(
+    h: torch.Tensor,
+    centers_mu: torch.Tensor,
+    cluster_id: torch.LongTensor,
+    tau: float = 0.1,
+) -> torch.Tensor:
+    """
+    prototypical CE against KMeans prototype label c(i)
+    """
+    h = F.normalize(h, dim=-1)
+    mu = F.normalize(centers_mu, dim=-1)  # [K,D]
+    logits = (h @ mu.t()) / tau  # [B,K]
+    return F.cross_entropy(logits, cluster_id.long())
+
+
+def pdcp_L_metric(
+    h: torch.Tensor,
+    cluster_id: torch.LongTensor,
+    gm: nn.Module,
+    max_pairs: int = 8192,
+) -> torch.Tensor:
+    """
+    prototype-level siamese metric loss
+    Lmetric = mean_{(i,j) in P} CE(gm(||hi-hj||), 1) + mean_{(i,j) in N} CE(gm(||hi-hj||), 0)
+
+    P: all sample pairs in same cluster
+    N: sample pairs in different clusters
+    gm takes a scalar distance -> logits for binary classification (2 classes)
+    """
+    device = h.device
+    B = h.shape[0]
+    if B < 2:
+        return torch.tensor(0.0, device=device)
+
+    # Build pair indices (upper triangle, i<j)
+    idx_i, idx_j = torch.triu_indices(B, B, offset=1, device=device)
+    same = cluster_id[idx_i] == cluster_id[idx_j]
+    diff = ~same
+
+    pos_i = idx_i[same]
+    pos_j = idx_j[same]
+    neg_i = idx_i[diff]
+    neg_j = idx_j[diff]
+
+    def _sample_pairs(pi, pj):
+        n = pi.numel()
+        if n <= max_pairs:
+            return pi, pj
+        perm = torch.randperm(n, device=device)[:max_pairs]
+        return pi[perm], pj[perm]
+
+    pos_i, pos_j = _sample_pairs(pos_i, pos_j)
+    neg_i, neg_j = _sample_pairs(neg_i, neg_j)
+
+    loss_terms = []
+
+    if pos_i.numel() > 0:
+        d_pos = (h[pos_i] - h[pos_j]).norm(dim=-1, keepdim=True)  # [P,1]
+        logit_pos = gm(d_pos)  # [P,2]
+        y_pos = torch.ones(logit_pos.shape[0], device=device, dtype=torch.long)
+        loss_terms.append(F.cross_entropy(logit_pos, y_pos))
+
+    if neg_i.numel() > 0:
+        d_neg = (h[neg_i] - h[neg_j]).norm(dim=-1, keepdim=True)  # [N,1]
+        logit_neg = gm(d_neg)  # [N,2]
+        y_neg = torch.zeros(logit_neg.shape[0], device=device, dtype=torch.long)
+        loss_terms.append(F.cross_entropy(logit_neg, y_neg))
+
+    if len(loss_terms) == 0:
+        return torch.tensor(0.0, device=device)
+
+    return torch.stack(loss_terms).mean()
+
+
+class Video_Former_3D(nn.Module):
+    """Perceiver Resampler with multi-head attention layer"""
+
+    def __init__(
+        self,
+        dim: int,
+        depth: int,
+        condition_dim: int = 1280,
+        dim_head: int = 64,
+        heads: int = 8,
+        num_latents: int = 64,
+        num_frame: int = 16,
+        num_time_embeds: int = 4,
+        ff_mult: int = 4,
+        activation: str = "gelu",
+        trainable: bool = True,
+        use_temporal: bool = False,
+        # ---- PDCP / CLS ----
+        use_cls: bool = True,
+        cls_mlp_hidden_mult: int = 2,  # hidden = cls_mlp_hidden_mult * D
+        cls_mlp_depth: int = 2,  # number of Linear+GELU blocks before final proj
+        contra_tau: float = 0.07,
+        proto_tau: float = 0.1,
+        gm_hidden: int = 256,
+    ):
+        super().__init__()
+
+        self.dim = dim
+        self.num_queries = num_latents
+        self.num_frame = num_frame
+        self.condition_dim = condition_dim
+        self.use_temporal = use_temporal
+
+        self.use_cls = use_cls
+        self.contra_tau = contra_tau
+        self.proto_tau = proto_tau
+
+        self.goal_emb = nn.Sequential(
+            nn.Linear(condition_dim, dim * 2), nn.GELU(), nn.Linear(dim * 2, dim)
+        )
+        frame_seq_len = num_latents // num_frame
+        self.latents = nn.Parameter(torch.randn(self.num_frame, frame_seq_len, dim))  # type: ignore[reportPrivateUsage]
+        self.time_pos_emb = nn.Parameter(torch.randn(num_time_embeds, 1, dim))  # type: ignore[reportPrivateUsage]
+        attn_mask = torch.ones((num_frame, num_frame))
+        # attn_mask = torch.tril(attn_mask).bool()
+
+        if self.use_cls:
+            self.clustering_token = nn.Parameter(torch.randn(1, 1, dim))
+            self.frame_seq_len_with_cls = frame_seq_len + 1
+        else:
+            self.clustering_token = None
+            self.frame_seq_len_with_cls = frame_seq_len
+
+        self.layers = nn.ModuleList([])
+
+        if self.use_temporal:
+            for _ in range(depth):
+                self.layers.append(
+                    nn.ModuleList(
+                        [
+                            PerceiverAttentionLayer(
+                                dim=dim, dim_head=dim_head, heads=heads
+                            ),
+                            # TempAttentionLayer(dim=dim, dim_head=dim_head, heads=heads),
+                            Attention(
+                                dim,
+                                num_heads=heads,
+                                qkv_bias=True,
+                                use_cross_attn=False,
+                                y_dim=512,
+                                attn_mask=attn_mask,
+                            ),
+                            feed_forward_layer(
+                                dim=dim, mult=ff_mult, activation=activation
+                            ),
+                        ]
+                    )
+                )
+        else:
+            for _ in range(depth):
+                self.layers.append(
+                    nn.ModuleList(
+                        [
+                            PerceiverAttentionLayer(
+                                dim=dim, dim_head=dim_head, heads=heads
+                            ),
+                            feed_forward_layer(
+                                dim=dim, mult=ff_mult, activation=activation
+                            ),
+                        ]
+                    )
+                )
+
+        # Layer normalization takes as input the query vector length
+        self.norm = nn.LayerNorm(dim)
+
+        # CLS reducer: [B,T,D] -> [B,D] via FFN
+        cls_in = num_frame * dim
+        hidden = cls_mlp_hidden_mult * dim
+        mlp = []
+        mlp.append(nn.LayerNorm(cls_in))
+        in_dim = cls_in
+        for _ in range(max(1, cls_mlp_depth)):
+            mlp.append(nn.Linear(in_dim, hidden))
+            mlp.append(nn.GELU())
+            in_dim = hidden
+        mlp.append(nn.Linear(in_dim, dim))
+        mlp.append(nn.LayerNorm(dim))
+        self.cls_reduce = nn.Sequential(*mlp)
+
+        # g_c projection head for contrastive z = g_c(h)
+        self.gc = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+        )
+
+        self.gm = nn.Sequential(
+            nn.Linear(1, gm_hidden),
+            nn.GELU(),
+            nn.LayerNorm(gm_hidden),
+            nn.Linear(gm_hidden, gm_hidden),
+            nn.GELU(),
+            nn.LayerNorm(gm_hidden),
+            nn.Linear(gm_hidden, 2),
+        )
+
+        self._update_trainable_state(trainable)
+
+    def _update_trainable_state(self, trainable: bool = True):
+        for param in self.parameters():
+            param.requires_grad = trainable
+
+    def forward(
+        self,
+        x_f: torch.Tensor,
+        mask: torch.BoolTensor = None,
+        extra: torch.Tensor = None,
+        # contrastive learning
+        skill_id: torch.LongTensor = None,  # for L_contra
+        centers_mu: torch.Tensor = None,  # [K,D] for L_proto
+        cluster_id: torch.LongTensor = None,  # for L_proto/L_metric
+        wc: float = 1.0,
+        wp: float = 1.0,
+        wm: float = 1.0,
+        max_pairs: int = 8192,
+    ):
+        """Run perceiver resampler on the input visual embeddings
+
+        Args:
+            x_f: Input visual embeddings of shape (batch_size, n_frames, n_features, d_visual)
+            mask: Mask for the input visual embeddings of shape (batch_size, n_frames)
+
+        Returns:
+            Resampler features of shape (batch_size, num_queries, d_visual)
+        """
+        assert x_f.ndim == 4
+
+        batch_size, max_length, _, dim = x_f.shape
+
+        # Mask the position embeddings for the padded frames
+        time_pos_emb = (
+            self.time_pos_emb[:max_length].unsqueeze(0).expand(batch_size, -1, -1, -1)
+        )  # [batch_size, max_length, 1, dim]
+        if mask is not None:
+            time_pos_emb = time_pos_emb * mask.unsqueeze(-1).unsqueeze(-1)
+
+        # Apply the position embeddings
+        x_f = self.goal_emb(x_f)
+        if extra is not None:
+            extra = repeat(extra, "b q d -> b T q d", T=max_length)
+            x_f = torch.cat([x_f, extra], dim=2)
+        x_f = x_f + time_pos_emb
+
+        # Flatten the frames
+        x_f = rearrange(x_f, "b T n d -> (b T) n d")
+
+        # Copy the latents for every element in the batch
+        x = repeat(self.latents, "T q d -> b T q d", b=batch_size)
+        x = rearrange(x, "b T q d -> (b T) q d")
+
+        if self.use_cls:
+            assert self.clustering_token != None
+            _cls = self.clustering_token.expand(x.shape[0], -1, -1)  # [(B*T), 1, D]
+            x = torch.cat([_cls, x], dim=1)  # [(B*T), 1+q, D]
+
+        # Apply attention and feed forward layer
+        if self.use_temporal:
+            for attn, Temp_attn, ffw in self.layers:
+                x = x + attn(x_f, x)
+                x = rearrange(x, "(b T) q d -> (b q) T d", b=batch_size)
+                x = x + Temp_attn(x)
+                x = rearrange(x, "(b q) T d -> (b T) q d", b=batch_size)
+                x = x + ffw(x)
+        else:
+            for attn, ffw in self.layers:
+                x = x + attn(x_f, x)
+                x = x + ffw(x)
+
+        # x = rearrange(x, 'l q d -> b T q d', b=batch_size)
+        x = x.reshape(batch_size, -1, self.frame_seq_len_with_cls, self.dim)
+
+        if self.use_cls:
+            cls_tokens = x[:, :, 0, :]  # (B, T, D)
+            tok = x[:, :, 1:, :]  # (B, T, q, D)
+        else:
+            cls_tokens = None
+            tok = x
+
+        tokens = rearrange(tok, "b T q d -> b (T q) d")
+        assert tokens.shape == torch.Size([batch_size, self.num_queries, self.dim])
+        tokens = self.norm(tokens)
+
+        # build h
+        h = None
+        if self.use_cls:
+            cls_seq: torch.Tensor = cls_tokens
+            if mask is not None:
+                cls_seq = cls_seq * mask.unsqueeze(-1).to(cls_seq.dtype)
+            cls_flat = cls_seq.reshape(
+                batch_size, self.num_frame * self.dim
+            )  # (B, (T*D))
+            h = self.cls_reduce(cls_flat)  # (B, D)
+
+        pdcp_loss = torch.tensor(0.0, device=tokens.device)
+
+        if h is not None:
+            Lc = torch.tensor(0.0, device=tokens.device)
+            if skill_id is not None:
+                z = self.gc(h)
+                Lc = pdcp_L_contra(z, skill_id, tau=self.contra_tau)
+
+            Lp = torch.tensor(0.0, device=tokens.device)
+            if centers_mu is not None and cluster_id is not None:
+                Lp = pdcp_L_proto(h, centers_mu, cluster_id, tau=self.proto_tau)
+
+            Lm = torch.tensor(0.0, device=tokens.device)
+            if self.gm is not None and cluster_id is not None:
+                Lm = pdcp_L_metric(h, cluster_id, gm=self.gm, max_pairs=max_pairs)
+
+            pdcp_loss = wc * Lc + wp * Lp + wm * Lm
+
+        return tokens, pdcp_loss
+
+
+class Video_Former_2D(nn.Module):
+    """Perceiver Resampler with multi-head attention layer"""
+
+    def __init__(
+        self,
+        dim: int,
+        depth: int,
+        condition_dim: int = 1280,
+        dim_head: int = 64,
+        heads: int = 8,
+        num_latents: int = 64,
+        num_frame: int = 16,
+        num_time_embeds: int = 4,
+        ff_mult: int = 4,
+        activation: str = "gelu",
+        trainable: bool = True,
+    ):
+        super().__init__()
+
+        self.dim = dim
+        self.num_queries = num_latents
+        self.num_frame = num_frame
+        self.condition_dim = condition_dim
+
+        self.goal_emb = nn.Sequential(
+            nn.Linear(condition_dim, dim * 2), nn.GELU(), nn.Linear(dim * 2, dim)
+        )
+        seq_len = num_latents // num_frame
+        self.latents = nn.Parameter(torch.randn(num_frame, seq_len, dim))  # type: ignore[reportPrivateUsage]
+        self.time_pos_emb = nn.Parameter(torch.randn(num_time_embeds, 1, dim))  # type: ignore[reportPrivateUsage]
+
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(
+                nn.ModuleList(
+                    [
+                        PerceiverAttentionLayer(
+                            dim=dim, dim_head=dim_head, heads=heads
+                        ),
+                        feed_forward_layer(
+                            dim=dim, mult=ff_mult, activation=activation
+                        ),
+                    ]
+                )
+            )
+
+        # Layer normalization takes as input the query vector length
+        self.norm = nn.LayerNorm(dim)
+
+        self._update_trainable_state(trainable)
+
+    def _update_trainable_state(self, trainable: bool = True):
+        for param in self.parameters():
+            param.requires_grad = trainable
+
+    def forward(self, x_f: torch.Tensor, mask: torch.BoolTensor = None):
+        """Run perceiver resampler on the input visual embeddings
+
+        Args:
+            x_f: Input visual embeddings of shape (batch_size, n_frames, n_features, d_visual)
+            mask: Mask for the input visual embeddings of shape (batch_size, n_frames)
+
+        Returns:
+            Resampler features of shape (batch_size, num_queries, d_visual)
+        """
+        assert x_f.ndim == 4
+
+        batch_size, max_length, _, dim = x_f.shape
+
+        assert dim == self.condition_dim
+
+        # Mask the position embeddings for the padded frames
+        time_pos_emb = (
+            self.time_pos_emb[:max_length].unsqueeze(0).expand(batch_size, -1, -1, -1)
+        )  # [batch_size, max_length, 1, dim]
+        if mask is not None:
+            time_pos_emb = time_pos_emb * mask.unsqueeze(-1).unsqueeze(-1)
+
+        # Apply the position embeddings
+        x_f = self.goal_emb(x_f)
+        x_f = x_f + time_pos_emb
+
+        # Flatten the frames
+        x_f = rearrange(x_f, "b T n d -> (b T) n d")
+
+        # Copy the latents for every element in the batch
+        x = repeat(self.latents, "T q d -> b T q d", b=batch_size)
+        x = rearrange(x, "b T q d -> (b T) q d")
+
+        # Apply attention and feed forward layer
+        for attn, ffw in self.layers:
+            x = x + attn(x_f, x)
+            x = x + ffw(x)
+
+        # x = rearrange(x, 'l q d -> b T q d', b=batch_size)
+        x = x.reshape(batch_size, -1, x.shape[1], x.shape[2])
+        x = rearrange(x, "b T q d -> b (T q) d")
+        assert x.shape == torch.Size([batch_size, self.num_queries, self.dim])
+        norm = self.norm(x)
+
+        return norm
