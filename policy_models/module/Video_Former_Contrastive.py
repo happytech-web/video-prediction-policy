@@ -235,116 +235,8 @@ class TempAttentionLayer(nn.Module):
 
 
 ###############################################
-#      contrastive learning utils             #
+#   contrastive components moved to module    #
 ###############################################
-
-
-def pdcp_L_contra(
-    z: torch.Tensor,
-    skill_id: torch.LongTensor,
-    tau: float = 0.07,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """
-    NT-Xent contrastive loss
-    treats tasks sharing the same skill as positive
-    """
-    B, _ = z.shape
-    z = F.normalize(z, dim=-1)
-
-    sim = (z @ z.t()) / tau  # (B,B)
-    sim: torch.Tensor = sim - sim.max(dim=1, keepdim=True).values.detach()
-
-    eye = torch.eye(B, device=z.device, dtype=torch.bool)
-    pos_mask = (skill_id[:, None] == skill_id[None, :]) & (~eye)  # (B,B)
-
-    exp_sim = sim.exp()
-    denom = exp_sim.masked_fill(eye, 0.0).sum(dim=1)  # (B,)
-
-    log_prob = sim - torch.log(denom.unsqueeze(1) + eps)  # (B,B)
-
-    pos_cnt = pos_mask.sum(dim=1)
-    if not (pos_cnt > 0).any():
-        return torch.Tensor(0.0, device=z.device)
-
-    pos_log_sum = (log_prob * pos_mask.float()).sum(dim=1)
-    loss_per_i = -pos_log_sum / (pos_cnt + eps)  # (B,)
-
-    return loss_per_i.mean()
-
-
-def pdcp_L_proto(
-    h: torch.Tensor,
-    centers_mu: torch.Tensor,
-    cluster_id: torch.LongTensor,
-    tau: float = 0.1,
-) -> torch.Tensor:
-    """
-    prototypical CE against KMeans prototype label c(i)
-    """
-    h = F.normalize(h, dim=-1)
-    mu = F.normalize(centers_mu, dim=-1)  # [K,D]
-    logits = (h @ mu.t()) / tau  # [B,K]
-    return F.cross_entropy(logits, cluster_id.long())
-
-
-def pdcp_L_metric(
-    h: torch.Tensor,
-    cluster_id: torch.LongTensor,
-    gm: nn.Module,
-    max_pairs: int = 8192,
-) -> torch.Tensor:
-    """
-    prototype-level siamese metric loss
-    Lmetric = mean_{(i,j) in P} CE(gm(||hi-hj||), 1) + mean_{(i,j) in N} CE(gm(||hi-hj||), 0)
-
-    P: all sample pairs in same cluster
-    N: sample pairs in different clusters
-    gm takes a scalar distance -> logits for binary classification (2 classes)
-    """
-    device = h.device
-    B = h.shape[0]
-    if B < 2:
-        return torch.tensor(0.0, device=device)
-
-    # Build pair indices (upper triangle, i<j)
-    idx_i, idx_j = torch.triu_indices(B, B, offset=1, device=device)
-    same = cluster_id[idx_i] == cluster_id[idx_j]
-    diff = ~same
-
-    pos_i = idx_i[same]
-    pos_j = idx_j[same]
-    neg_i = idx_i[diff]
-    neg_j = idx_j[diff]
-
-    def _sample_pairs(pi, pj):
-        n = pi.numel()
-        if n <= max_pairs:
-            return pi, pj
-        perm = torch.randperm(n, device=device)[:max_pairs]
-        return pi[perm], pj[perm]
-
-    pos_i, pos_j = _sample_pairs(pos_i, pos_j)
-    neg_i, neg_j = _sample_pairs(neg_i, neg_j)
-
-    loss_terms = []
-
-    if pos_i.numel() > 0:
-        d_pos = (h[pos_i] - h[pos_j]).norm(dim=-1, keepdim=True)  # [P,1]
-        logit_pos = gm(d_pos)  # [P,2]
-        y_pos = torch.ones(logit_pos.shape[0], device=device, dtype=torch.long)
-        loss_terms.append(F.cross_entropy(logit_pos, y_pos))
-
-    if neg_i.numel() > 0:
-        d_neg = (h[neg_i] - h[neg_j]).norm(dim=-1, keepdim=True)  # [N,1]
-        logit_neg = gm(d_neg)  # [N,2]
-        y_neg = torch.zeros(logit_neg.shape[0], device=device, dtype=torch.long)
-        loss_terms.append(F.cross_entropy(logit_neg, y_neg))
-
-    if len(loss_terms) == 0:
-        return torch.tensor(0.0, device=device)
-
-    return torch.stack(loss_terms).mean()
 
 
 class Video_Former_3D(nn.Module):
@@ -368,9 +260,6 @@ class Video_Former_3D(nn.Module):
         use_cls: bool = True,
         cls_mlp_hidden_mult: int = 2,  # hidden = cls_mlp_hidden_mult * D
         cls_mlp_depth: int = 2,  # number of Linear+GELU blocks before final proj
-        contra_tau: float = 0.07,
-        proto_tau: float = 0.1,
-        gm_hidden: int = 256,
     ):
         super().__init__()
 
@@ -381,8 +270,6 @@ class Video_Former_3D(nn.Module):
         self.use_temporal = use_temporal
 
         self.use_cls = use_cls
-        self.contra_tau = contra_tau
-        self.proto_tau = proto_tau
 
         self.goal_emb = nn.Sequential(
             nn.Linear(condition_dim, dim * 2), nn.GELU(), nn.Linear(dim * 2, dim)
@@ -457,23 +344,6 @@ class Video_Former_3D(nn.Module):
         mlp.append(nn.LayerNorm(dim))
         self.cls_reduce = nn.Sequential(*mlp)
 
-        # g_c projection head for contrastive z = g_c(h)
-        self.gc = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.GELU(),
-            nn.Linear(dim, dim),
-        )
-
-        self.gm = nn.Sequential(
-            nn.Linear(1, gm_hidden),
-            nn.GELU(),
-            nn.LayerNorm(gm_hidden),
-            nn.Linear(gm_hidden, gm_hidden),
-            nn.GELU(),
-            nn.LayerNorm(gm_hidden),
-            nn.Linear(gm_hidden, 2),
-        )
-
         self._update_trainable_state(trainable)
 
     def _update_trainable_state(self, trainable: bool = True):
@@ -485,14 +355,6 @@ class Video_Former_3D(nn.Module):
         x_f: torch.Tensor,
         mask: torch.BoolTensor = None,
         extra: torch.Tensor = None,
-        # contrastive learning
-        skill_id: torch.LongTensor = None,  # for L_contra
-        centers_mu: torch.Tensor = None,  # [K,D] for L_proto
-        cluster_id: torch.LongTensor = None,  # for L_proto/L_metric
-        wc: float = 1.0,
-        wp: float = 1.0,
-        wm: float = 1.0,
-        max_pairs: int = 8192,
     ):
         """Run perceiver resampler on the input visual embeddings
 
@@ -571,25 +433,8 @@ class Video_Former_3D(nn.Module):
             )  # (B, (T*D))
             h = self.cls_reduce(cls_flat)  # (B, D)
 
-        pdcp_loss = torch.tensor(0.0, device=tokens.device)
-
-        if h is not None:
-            Lc = torch.tensor(0.0, device=tokens.device)
-            if skill_id is not None:
-                z = self.gc(h)
-                Lc = pdcp_L_contra(z, skill_id, tau=self.contra_tau)
-
-            Lp = torch.tensor(0.0, device=tokens.device)
-            if centers_mu is not None and cluster_id is not None:
-                Lp = pdcp_L_proto(h, centers_mu, cluster_id, tau=self.proto_tau)
-
-            Lm = torch.tensor(0.0, device=tokens.device)
-            if self.gm is not None and cluster_id is not None:
-                Lm = pdcp_L_metric(h, cluster_id, gm=self.gm, max_pairs=max_pairs)
-
-            pdcp_loss = wc * Lc + wp * Lp + wm * Lm
-
-        return tokens, pdcp_loss
+        # Return only tokens and h; losses are computed outside
+        return tokens, h
 
 
 class Video_Former_2D(nn.Module):

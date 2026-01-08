@@ -12,7 +12,11 @@ from policy_models.edm_diffusion.score_wrappers import GCDenoiser
 from policy_models.module.clip_lang_encoder import LangClip
 from policy_models.edm_diffusion.gc_sampling import *
 from policy_models.utils.lr_schedulers.tri_stage_scheduler import TriStageLRScheduler
-from policy_models.module.Video_Former import Video_Former_2D,Video_Former_3D
+from policy_models.module.Video_Former_Contrastive import (
+    Video_Former_2D,
+    Video_Former_3D,
+)
+from policy_models.module.contrastive_head import ContrastiveHead
 from diffusers import StableVideoDiffusionPipeline
 from policy_models.module.diffusion_extract import Diffusion_feature_extractor
 from transformers import AutoTokenizer, CLIPTextModelWithProjection
@@ -159,6 +163,9 @@ class VPP_Policy(pl.LightningModule):
                                 device=self.device,
                                 sigma_data=0.5).to(self.device)
 
+        # optional contrastive head (decoupled from Video Former to follow LoD)
+        self.contrastive_head = ContrastiveHead(dim=latent_dim)
+
         self.optimizer_config = optimizer
         self.lr_scheduler = lr_scheduler
         self.save_hyperparameters()
@@ -265,6 +272,17 @@ class VPP_Policy(pl.LightningModule):
         action_loss += act_loss
         total_loss += act_loss
 
+        # Optional contrastive / prototype losses using h if available
+        pdcp_loss = torch.tensor(0.0, device=self.device)
+        h = predictive_feature.get('h', None)
+        if h is not None and self.contrastive_head is not None:
+            if 'skill_id' in dataset_batch:
+                pdcp_loss = pdcp_loss + self.contrastive_head.loss_contra(h, dataset_batch['skill_id'])
+            if 'centers_mu' in dataset_batch and 'cluster_id' in dataset_batch:
+                pdcp_loss = pdcp_loss + self.contrastive_head.loss_proto(h, dataset_batch['centers_mu'], dataset_batch['cluster_id'])
+                pdcp_loss = pdcp_loss + self.contrastive_head.loss_metric(h, dataset_batch['cluster_id'])
+        total_loss += pdcp_loss
+
         total_bs = dataset_batch["actions"].shape[0]
 
         self._log_training_metrics(action_loss, total_loss, total_bs)
@@ -344,10 +362,17 @@ class VPP_Policy(pl.LightningModule):
         perceptual_features = torch.cat([perceptual_features, gripper_feature], dim=2)
 
         perceptual_features = perceptual_features.to(torch.float32)
-        perceptual_features = self.Video_Former(perceptual_features)
+        # Use contrastive Video Former (3D returns tokens and h)
+        if self.use_Former == '3d':
+            perceptual_tokens, h = self.Video_Former(perceptual_features)
+        else:
+            perceptual_tokens = self.Video_Former(perceptual_features)
+            h = None
         if self.use_Former=='linear':
-            perceptual_features = rearrange(perceptual_features, 'b T q d -> b (T q) d')
-        predictive_feature = {'state_images': perceptual_features}
+            perceptual_tokens = rearrange(perceptual_tokens, 'b T q d -> b (T q) d')
+        predictive_feature = {'state_images': perceptual_tokens}
+        if h is not None:
+            predictive_feature['h'] = h
         predictive_feature['modality'] = modality
         return predictive_feature, latent_goal
 
@@ -596,11 +621,14 @@ class VPP_Policy(pl.LightningModule):
         perceptual_features = torch.cat([perceptual_features, gripper_feature], dim=2)
 
         perceptual_features = perceptual_features.to(torch.float32)
-        perceptual_features = self.Video_Former(perceptual_features)
+        if self.use_Former == '3d':
+            perceptual_tokens, _h = self.Video_Former(perceptual_features)
+        else:
+            perceptual_tokens = self.Video_Former(perceptual_features)
         if self.use_Former == 'linear':
-            perceptual_features = rearrange(perceptual_features, 'b T q d -> b (T q) d')
+            perceptual_tokens = rearrange(perceptual_tokens, 'b T q d -> b (T q) d')
 
-        perceptual_emb = {'state_images': perceptual_features}
+        perceptual_emb = {'state_images': perceptual_tokens}
 
         perceptual_emb['modality'] = "lang"
         #print('latent_goal_shape:',latent_goal.shape)
