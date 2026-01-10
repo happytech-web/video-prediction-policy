@@ -14,6 +14,7 @@ sys.path.insert(0, Path(__file__).absolute().parents[1].as_posix())
 import hydra
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 import torch
 from glob import glob
 from copy import deepcopy
@@ -77,7 +78,9 @@ def create_logger(logging_dir):
 #@hydra.main(config_path="./policy_conf", config_name="VPP_Calvinabc_train")
 def train(cfg: DictConfig) -> None:
     os.environ['HYDRA_FULL_ERROR'] = '1'
-    accelerator = Accelerator()
+    # Enable DDP to tolerate legitimately unused parameters (e.g., optional heads)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
     device = accelerator.device
     # new added
