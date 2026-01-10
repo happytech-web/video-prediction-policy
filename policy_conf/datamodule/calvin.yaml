@@ -1,6 +1,9 @@
 _target_: policy_models.datasets.hulc_data_module.HulcDataModule
 _recursive_: false
 
+use_skill_id: false
+task_index_json: ""
+
 datasets:
   lang_dataset:
     _target_: policy_models.datasets.disk_dataset.ExtendedDiskDataset
