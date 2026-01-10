@@ -206,6 +206,11 @@ class VPP_Policy(pl.LightningModule):
         self.kmeans_refresh_interval = kmeans_refresh_interval
         self.kmeans_loader_key = kmeans_loader_key
         self.kmeans_mgr = KMeansManager(n_clusters=self.kmeans_k, feature_dim=latent_dim) if self.use_kmeans else None
+        # last-step loss components for external logging
+        self._last_action_loss = 0.0
+        self._last_contra_loss = 0.0
+        self._last_proto_loss = 0.0
+        self._last_metric_loss = 0.0
 
     def process_device(self):
         self.TVP_encoder.pipeline = self.TVP_encoder.pipeline.to(self.device)
@@ -288,14 +293,19 @@ class VPP_Policy(pl.LightningModule):
 
         # Optional contrastive / prototype losses using h if available
         pdcp_loss = torch.tensor(0.0, device=self.device)
+        contra_loss = torch.tensor(0.0, device=self.device)
+        proto_loss = torch.tensor(0.0, device=self.device)
+        metric_loss = torch.tensor(0.0, device=self.device)
         h = predictive_feature.get('h', None)
         if h is not None and self.contrastive_head is not None:
             if 'skill_id' in dataset_batch:
-                pdcp_loss = pdcp_loss + self.contrastive_head.loss_contra(h, dataset_batch['skill_id'])
+                contra_loss = self.contrastive_head.loss_contra(h, dataset_batch['skill_id'])
+                pdcp_loss = pdcp_loss + contra_loss
             # Use provided kmeans info if available in batch
             if 'centers_mu' in dataset_batch and 'cluster_id' in dataset_batch:
-                pdcp_loss = pdcp_loss + self.contrastive_head.loss_proto(h, dataset_batch['centers_mu'], dataset_batch['cluster_id'])
-                pdcp_loss = pdcp_loss + self.contrastive_head.loss_metric(h, dataset_batch['cluster_id'])
+                proto_loss = self.contrastive_head.loss_proto(h, dataset_batch['centers_mu'], dataset_batch['cluster_id'])
+                metric_loss = self.contrastive_head.loss_metric(h, dataset_batch['cluster_id'])
+                pdcp_loss = pdcp_loss + proto_loss + metric_loss
             # Otherwise, consume from KMeansManager if ready
             elif self.use_kmeans and self.kmeans_mgr is not None and self.kmeans_mgr.ready():
                 if 'idx' in dataset_batch:
@@ -305,9 +315,16 @@ class VPP_Policy(pl.LightningModule):
                     cluster_id = self.kmeans_mgr.get_assignments(idx.to(h.device))
                     centers_mu = self.kmeans_mgr.get_centers()
                     if cluster_id is not None and centers_mu is not None:
-                        pdcp_loss = pdcp_loss + self.contrastive_head.loss_proto(h, centers_mu.to(h.device), cluster_id)
-                        pdcp_loss = pdcp_loss + self.contrastive_head.loss_metric(h, cluster_id)
+                        proto_loss = self.contrastive_head.loss_proto(h, centers_mu.to(h.device), cluster_id)
+                        metric_loss = self.contrastive_head.loss_metric(h, cluster_id)
+                        pdcp_loss = pdcp_loss + proto_loss + metric_loss
         total_loss += pdcp_loss
+
+        # cache components for external logging
+        self._last_action_loss = float(action_loss.detach().item())
+        self._last_contra_loss = float(contra_loss.detach().item()) if torch.is_tensor(contra_loss) else 0.0
+        self._last_proto_loss = float(proto_loss.detach().item()) if torch.is_tensor(proto_loss) else 0.0
+        self._last_metric_loss = float(metric_loss.detach().item()) if torch.is_tensor(metric_loss) else 0.0
 
         total_bs = dataset_batch["actions"].shape[0]
 
@@ -766,10 +783,16 @@ class VPP_Policy(pl.LightningModule):
         except Exception:
             return
         device = self.device if hasattr(self, 'device') else next(self.parameters()).device
+        import time as _time
+        t0 = _time.time()
         feats_all, idx_all = self.kmeans_mgr.extract_features(self, loader, device, self._extract_h_from_batch)
         if feats_all.numel() == 0:
             return
+        logger.info(f"KMeans: collected features {tuple(feats_all.shape)} with indices {tuple(idx_all.shape)}")
         self.kmeans_mgr.update(feats_all, idx_all)
+        t1 = _time.time()
+        centers = self.kmeans_mgr.get_centers()
+        logger.info(f"KMeans: updated centers shape={None if centers is None else tuple(centers.shape)} in {t1-t0:.2f}s")
 
 
 @rank_zero_only

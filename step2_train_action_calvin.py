@@ -148,6 +148,10 @@ def train(cfg: DictConfig) -> None:
     train_steps = 0
     log_steps = 0
     running_loss = 0
+    running_action = 0.0
+    running_contra = 0.0
+    running_proto = 0.0
+    running_metric = 0.0
     start_time = time()
     eval_batch = None
     best_eval_loss = 1e8
@@ -169,6 +173,15 @@ def train(cfg: DictConfig) -> None:
             Ir_scheduler.step()
             update_ema(ema, model)
             running_loss += loss
+            # collect component losses for logging
+            try:
+                _m = model.module if accelerator.num_processes > 1 else model
+                running_action += float(getattr(_m, "_last_action_loss", 0.0))
+                running_contra += float(getattr(_m, "_last_contra_loss", 0.0))
+                running_proto += float(getattr(_m, "_last_proto_loss", 0.0))
+                running_metric += float(getattr(_m, "_last_metric_loss", 0.0))
+            except Exception:
+                pass
             log_steps += 1
             train_steps += 1
             if train_steps % cfg.log_every == 0:
@@ -179,12 +192,21 @@ def train(cfg: DictConfig) -> None:
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 # avg_loss = avg_loss.item() / accelerator.num_processes # why divide?
                 avg_loss = avg_loss.item()
+                # component avgs
+                avg_action = running_action / max(1, log_steps)
+                avg_contra = running_contra / max(1, log_steps)
+                avg_proto = running_proto / max(1, log_steps)
+                avg_metric = running_metric / max(1, log_steps)
 
                 if accelerator.is_main_process:
                     logger.info(
-                        f"(step={train_steps:07d}) Train total Loss : {avg_loss:.6f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                        f"(step={train_steps:07d}) Train Loss total={avg_loss:.6f} | action={avg_action:.6f} contra={avg_contra:.6f} proto={avg_proto:.6f} metric={avg_metric:.6f} | {steps_per_sec:.2f} steps/s")
                 # Reset monitoring variables:
                 running_loss = 0
+                running_action = 0.0
+                running_contra = 0.0
+                running_proto = 0.0
+                running_metric = 0.0
                 log_steps = 0
                 start_time = time()
         if accelerator.is_main_process:
@@ -260,6 +282,11 @@ if __name__ == "__main__":
                         help="Folder name under each scene containing auto_lang_ann.npy (e.g., 'lang_annotations' for debug dataset)")
     parser.add_argument("--task_index_json", type=str, default="",
                         help="Path to JSON built by scripts/build_calvin_task_index.py for skill/task ids. If set, skill_id will be injected into batches.")
+    # KMeans options
+    parser.add_argument("--use_kmeans", action="store_true", help="Enable K-Means clustering for prototype losses")
+    parser.add_argument("--kmeans_k", type=int, default=50, help="Number of K-Means clusters")
+    parser.add_argument("--kmeans_refresh_interval", type=int, default=1, help="Epoch interval to refresh K-Means over full dataset")
+    parser.add_argument("--kmeans_loader_key", type=str, default="lang", help="Which train loader key to use for K-Means feature extraction")
     
     args = parser.parse_args()
     from hydra import compose, initialize
@@ -285,4 +312,9 @@ if __name__ == "__main__":
                 cfg.datamodule.use_skill_id = False
             if not hasattr(cfg.datamodule, 'task_index_json'):
                 cfg.datamodule.task_index_json = ""
+    # KMeans config from CLI
+    cfg.model.use_kmeans = bool(args.use_kmeans)
+    cfg.model.kmeans_k = int(args.kmeans_k)
+    cfg.model.kmeans_refresh_interval = int(args.kmeans_refresh_interval)
+    cfg.model.kmeans_loader_key = str(args.kmeans_loader_key)
     train(cfg)

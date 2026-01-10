@@ -1,19 +1,20 @@
 import math
 import numpy as np
 from typing import Optional, Tuple, List
+import logging
 
 import torch
 import torch.distributed as dist
+
+logger = logging.getLogger(__name__)
 
 
 def _import_faiss():
     try:
         import faiss  # type: ignore
         return faiss
-    except Exception as e:
-        raise ImportError(
-            "FAISS is required for KMeansManager. Please install faiss-gpu (or faiss-cpu)"
-        ) from e
+    except Exception:
+        return None
 
 
 def _gather_cat_tensor(t: torch.Tensor) -> torch.Tensor:
@@ -111,6 +112,8 @@ class KMeansManager:
 
     def _kmeans_faiss(self, x_np: np.ndarray) -> np.ndarray:
         faiss = _import_faiss()
+        if faiss is None:
+            raise ImportError("faiss not available")
         x_np = self._preprocess_features_faiss(x_np)
         n, d = x_np.shape
         clus = faiss.Clustering(d, self.n_clusters)
@@ -145,6 +148,41 @@ class KMeansManager:
                 centers[k] = x[mask].mean(dim=0)
         return centers
 
+    def _kmeans_torch(self, x: torch.Tensor, n_iter: int = 20) -> torch.Tensor:
+        """Simple K-Means in torch as a fallback. Returns assignments [N]."""
+        device = x.device
+        N = x.shape[0]
+        K = self.n_clusters
+        if N < K:
+            # degenerate; assign all to zero cluster
+            return torch.zeros(N, dtype=torch.long, device=device)
+        # init centers by random samples
+        perm = torch.randperm(N, device=device)
+        centers = x[perm[:K]].clone()
+        for _ in range(n_iter):
+            # assign
+            # dist^2 = |x|^2 + |c|^2 - 2 x c
+            x2 = (x * x).sum(dim=1, keepdim=True)  # [N,1]
+            c2 = (centers * centers).sum(dim=1).unsqueeze(0)  # [1,K]
+            sim = x @ centers.t()  # [N,K]
+            d2 = x2 + c2 - 2.0 * sim
+            assign = d2.argmin(dim=1)
+            # update
+            new_centers = torch.zeros_like(centers)
+            for k in range(K):
+                mask = assign == k
+                if mask.any():
+                    new_centers[k] = x[mask].mean(dim=0)
+                else:
+                    # re-seed empty cluster
+                    ridx = torch.randint(0, N, (1,), device=device)
+                    new_centers[k] = x[ridx]
+            if torch.allclose(new_centers, centers, atol=1e-4, rtol=0.0):
+                centers = new_centers
+                break
+            centers = new_centers
+        return assign
+
     def run_kmeans(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run kmeans on rank0, return (assignments[N], centers[K,D])."""
         # normalize to unit length (pre-FAISS PCA+L2 also normalizes internally)
@@ -155,9 +193,18 @@ class KMeansManager:
             rank = 0
 
         if rank == 0:
-            assign_np = self._kmeans_faiss(x_n.cpu().numpy())
-            assign = torch.from_numpy(assign_np).long()
-            centers = self._compute_centers_from_assign(x_n, assign).to(x.dtype)
+            try:
+                faiss = _import_faiss()
+                if faiss is None:
+                    raise ImportError("faiss unavailable")
+                assign_np = self._kmeans_faiss(x_n.cpu().numpy())
+                assign = torch.from_numpy(assign_np).long()
+                centers = self._compute_centers_from_assign(x_n, assign).to(x.dtype)
+                logger.info("KMeans: used FAISS backend")
+            except Exception as e:
+                logger.warning(f"KMeans: FAISS backend unavailable ({e}); falling back to torch implementation")
+                assign = self._kmeans_torch(x_n).long()
+                centers = self._compute_centers_from_assign(x_n, assign).to(x.dtype)
         else:
             assign = torch.empty(x_n.shape[0], dtype=torch.long)
             centers = torch.empty(self.n_clusters, x_n.shape[1], dtype=x.dtype)
