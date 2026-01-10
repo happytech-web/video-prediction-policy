@@ -1,5 +1,6 @@
 import logging
 from typing import Dict, Optional, Tuple
+import torch
 from functools import partial
 from torch import einsum, nn
 from einops import rearrange, repeat
@@ -17,6 +18,7 @@ from policy_models.module.Video_Former_Contrastive import (
     Video_Former_3D,
 )
 from policy_models.module.contrastive_head import ContrastiveHead
+from policy_models.utils.kmeans_manager import KMeansManager
 from diffusers import StableVideoDiffusionPipeline
 from policy_models.module.diffusion_extract import Diffusion_feature_extractor
 from transformers import AutoTokenizer, CLIPTextModelWithProjection
@@ -71,6 +73,11 @@ class VPP_Policy(pl.LightningModule):
             obs_seq_len: int = 1,
             action_dim: int = 7,
             action_seq_len: int = 10,
+            # KMeans / clustering options
+            use_kmeans: bool = False,
+            kmeans_k: int = 50,
+            kmeans_refresh_interval: int = 1,
+            kmeans_loader_key: str = 'lang',
     ):
         super(VPP_Policy, self).__init__()
         self.latent_dim = latent_dim
@@ -193,6 +200,13 @@ class VPP_Policy(pl.LightningModule):
             param.requires_grad = False
         self.model.inner_model.pos_emb.requires_grad = False
 
+        # KMeans manager
+        self.use_kmeans = use_kmeans
+        self.kmeans_k = kmeans_k
+        self.kmeans_refresh_interval = kmeans_refresh_interval
+        self.kmeans_loader_key = kmeans_loader_key
+        self.kmeans_mgr = KMeansManager(n_clusters=self.kmeans_k, feature_dim=latent_dim) if self.use_kmeans else None
+
     def process_device(self):
         self.TVP_encoder.pipeline = self.TVP_encoder.pipeline.to(self.device)
         self.TVP_encoder.text_encoder = self.TVP_encoder.text_encoder.to(self.device)
@@ -278,9 +292,21 @@ class VPP_Policy(pl.LightningModule):
         if h is not None and self.contrastive_head is not None:
             if 'skill_id' in dataset_batch:
                 pdcp_loss = pdcp_loss + self.contrastive_head.loss_contra(h, dataset_batch['skill_id'])
+            # Use provided kmeans info if available in batch
             if 'centers_mu' in dataset_batch and 'cluster_id' in dataset_batch:
                 pdcp_loss = pdcp_loss + self.contrastive_head.loss_proto(h, dataset_batch['centers_mu'], dataset_batch['cluster_id'])
                 pdcp_loss = pdcp_loss + self.contrastive_head.loss_metric(h, dataset_batch['cluster_id'])
+            # Otherwise, consume from KMeansManager if ready
+            elif self.use_kmeans and self.kmeans_mgr is not None and self.kmeans_mgr.ready():
+                if 'idx' in dataset_batch:
+                    idx = dataset_batch['idx']
+                    if not isinstance(idx, torch.Tensor):
+                        idx = torch.as_tensor(idx, device=h.device)
+                    cluster_id = self.kmeans_mgr.get_assignments(idx.to(h.device))
+                    centers_mu = self.kmeans_mgr.get_centers()
+                    if cluster_id is not None and centers_mu is not None:
+                        pdcp_loss = pdcp_loss + self.contrastive_head.loss_proto(h, centers_mu.to(h.device), cluster_id)
+                        pdcp_loss = pdcp_loss + self.contrastive_head.loss_metric(h, cluster_id)
         total_loss += pdcp_loss
 
         total_bs = dataset_batch["actions"].shape[0]
@@ -701,6 +727,10 @@ class VPP_Policy(pl.LightningModule):
     @rank_zero_only
     def on_train_epoch_end(self, unused: Optional = None) -> None:  # type: ignore
         logger.info(f"Finished training epoch {self.current_epoch}")
+        # Alternating: run full KMeans update
+        if self.use_kmeans and (self.current_epoch + 1) % self.kmeans_refresh_interval == 0:
+            logger.info("Running KMeans full update over dataset...")
+            self.run_kmeans_full_update()
 
     @rank_zero_only
     def on_validation_epoch_end(self) -> None:
@@ -708,6 +738,38 @@ class VPP_Policy(pl.LightningModule):
 
     def on_validation_epoch_start(self) -> None:
         log_rank_0(f"Start validation epoch {self.current_epoch}")
+
+    @torch.no_grad()
+    def _extract_h_from_batch(self, dataset_batch):
+        pf, _ = self.extract_predictive_feature(dataset_batch)
+        h = pf.get('h', None)
+        idx = dataset_batch.get('idx', None)
+        if h is None or idx is None:
+            return None, None
+        if not isinstance(idx, torch.Tensor):
+            idx = torch.as_tensor(idx, device=h.device)
+        return h.detach(), idx.long().detach()
+
+    @torch.no_grad()
+    def run_kmeans_full_update(self):
+        if not self.use_kmeans or self.kmeans_mgr is None:
+            return
+        if not hasattr(self, 'trainer') or self.trainer is None or not hasattr(self.trainer, 'datamodule'):
+            return
+        dm = self.trainer.datamodule
+        try:
+            loaders = dm.train_dataloader()
+            if isinstance(loaders, dict):
+                loader = loaders[self.kmeans_loader_key] if self.kmeans_loader_key in loaders else next(iter(loaders.values()))
+            else:
+                loader = loaders
+        except Exception:
+            return
+        device = self.device if hasattr(self, 'device') else next(self.parameters()).device
+        feats_all, idx_all = self.kmeans_mgr.extract_features(self, loader, device, self._extract_h_from_batch)
+        if feats_all.numel() == 0:
+            return
+        self.kmeans_mgr.update(feats_all, idx_all)
 
 
 @rank_zero_only
