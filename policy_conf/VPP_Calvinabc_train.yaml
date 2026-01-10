@@ -60,6 +60,11 @@ model:
   timestep: 20
   use_all_layer: True
   extract_layer_idx: 1
+  # KMeans / contrastive options (defaults; can be overridden via CLI)
+  use_kmeans: false
+  kmeans_k: 50
+  kmeans_refresh_interval: 1
+  kmeans_loader_key: lang
   optimizer:
     _target_: torch.optim.AdamW
     transformer_weight_decay: 0.05
