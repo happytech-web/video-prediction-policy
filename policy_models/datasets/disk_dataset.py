@@ -3,7 +3,7 @@ from itertools import chain
 import logging
 from pathlib import Path
 import pickle
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 import random
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -166,6 +166,8 @@ class ExtendedDiskDataset(DiskDataset):
         action_seq_len: int,
         future_range: int,
         img_gen_frame_diff: int = 3,
+        use_skill_id: bool = False,
+        task_index_json: str = "",
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
@@ -175,6 +177,31 @@ class ExtendedDiskDataset(DiskDataset):
         self.ep_start_end_ids = np.load(self.abs_datasets_dir / "ep_start_end_ids.npy")  # Load sequence boundaries
         self.img_gen_frame_diff = img_gen_frame_diff
         self.random_frame_diff = False if img_gen_frame_diff > -1 else True 
+        self.use_skill_id = use_skill_id
+        self.task_index_json = task_index_json
+        self._skill_intervals: Optional[List[Tuple[int, int, int]]] = None
+
+        # load skill/task intervals if requested
+        if self.use_skill_id and isinstance(self.task_index_json, str) and len(self.task_index_json) > 0:
+            try:
+                import json as _json
+                with open(self.task_index_json, "r", encoding="utf-8") as f:
+                    obj = _json.load(f)
+                split = "validation" if self.validation else "training"
+                intervals: List[Tuple[int, int, int]] = []
+                for scene in obj.get("scenes", []):
+                    if scene.get("split") != split:
+                        continue
+                    for ann in scene.get("annotations", []):
+                        s = int(ann.get("start"))
+                        e = int(ann.get("end"))
+                        tid = int(ann.get("task_id", -1))
+                        intervals.append((s, e, tid))
+                self._skill_intervals = intervals if len(intervals) > 0 else None
+                logger.info(f"Loaded {len(self._skill_intervals)} skill intervals for split={split} from {self.task_index_json}")
+            except Exception as ex:
+                logger.warning(f"Failed to load task_index_json={self.task_index_json}: {ex}")
+                self._skill_intervals = None
         # self.min_window_size = self.action_seq_len
         # self.max_window_size = self.action_seq_len + self.future_range
         
@@ -215,6 +242,12 @@ class ExtendedDiskDataset(DiskDataset):
         if self.with_lang:
             episode["language"] = self.lang_ann[self.lang_lookup[idx]][0]  # TODO check  [0]
             episode["language_text"] = self.lang_text[self.lang_lookup[idx]] #[0]  # TODO check  [0]
+        # inject skill_id if available
+        if self._skill_intervals is not None:
+            tid = self._lookup_task_id(start_idx)
+            if tid is not None and tid >= 0:
+                # store as scalar np array; collate will turn into [B]
+                episode["skill_id"] = np.array(tid, dtype=np.int64)
         
         # get the random future state as goal
         # goal_idx = end_idx + window_size
@@ -254,6 +287,14 @@ class ExtendedDiskDataset(DiskDataset):
             else:
                 merged_episode[key] = episode2[key]
         return merged_episode
+
+    def _lookup_task_id(self, frame_idx: int) -> Optional[int]:
+        if self._skill_intervals is None:
+            return None
+        for s, e, tid in self._skill_intervals:
+            if s <= frame_idx <= e:
+                return tid
+        return None
     
     def _build_file_indices(self, abs_datasets_dir: Path) -> np.ndarray:
         """
@@ -277,4 +318,3 @@ class ExtendedDiskDataset(DiskDataset):
             for idx in range(start_idx, end_idx + 1 - self.min_window_size):
                 episode_lookup.append(idx)
         return np.array(episode_lookup)
-

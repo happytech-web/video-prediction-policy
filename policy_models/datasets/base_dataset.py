@@ -146,6 +146,17 @@ class BaseDataset(Dataset):
         seq_lang = process_language(episode, self.transforms, self.with_lang)
         info = self._add_language_info(info, idx)
         seq_dict = {**seq_state_obs, **seq_rgb_obs, **seq_acts, **info, **seq_lang}  # type:ignore
+        # Optional: include skill_id if provided by dataset implementation
+        if "skill_id" in episode:
+            try:
+                import numpy as _np  # local import to avoid global dependency at import time
+                val = episode["skill_id"]
+                # ensure scalar -> tensor long
+                if isinstance(val, _np.ndarray) and val.size == 1:
+                    val = int(val.reshape(()).item())
+                seq_dict["skill_id"] = torch.as_tensor(val, dtype=torch.long)
+            except Exception:
+                pass
         seq_dict["idx"] = idx  # type:ignore
         return seq_dict
 

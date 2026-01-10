@@ -253,14 +253,33 @@ if __name__ == "__main__":
     parser.add_argument("--video_model_path", type=str, default="")
     parser.add_argument("--text_encoder_path", type=str, default="")
     parser.add_argument("--root_data_dir", type=str, default="")
+    parser.add_argument("--lang_folder", type=str, default="lang_annotations",
+                        help="Folder name under each scene containing auto_lang_ann.npy (e.g., 'lang_annotations' for debug dataset)")
+    parser.add_argument("--task_index_json", type=str, default="",
+                        help="Path to JSON built by scripts/build_calvin_task_index.py for skill/task ids. If set, skill_id will be injected into batches.")
     
     args = parser.parse_args()
     from hydra import compose, initialize
     
     with initialize(config_path="./policy_conf", job_name="VPP_Calvinabc_train"):
         cfg = compose(config_name="VPP_Calvinabc_train")
-    cfg.model.pretrained_model_path = args.video_model_path
-    cfg.model.text_encoder_path = args.text_encoder_path
+    if args.video_model_path:
+        cfg.model.pretrained_model_path = args.video_model_path
+    if args.text_encoder_path:
+        cfg.model.text_encoder_path = args.text_encoder_path
     cfg.root_data_dir = args.root_data_dir
     cfg.datamodule.root_data_dir = args.root_data_dir
+    # Allow overriding language folder for debug dataset compatibility
+    cfg.lang_folder = args.lang_folder
+    # Pass task index json to datamodule if provided
+    if hasattr(cfg, 'datamodule'):
+        if args.task_index_json:
+            cfg.datamodule.task_index_json = args.task_index_json
+            cfg.datamodule.use_skill_id = True
+        else:
+            # ensure defaults if not present in config
+            if not hasattr(cfg.datamodule, 'use_skill_id'):
+                cfg.datamodule.use_skill_id = False
+            if not hasattr(cfg.datamodule, 'task_index_json'):
+                cfg.datamodule.task_index_json = ""
     train(cfg)

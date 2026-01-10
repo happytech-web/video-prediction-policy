@@ -28,6 +28,8 @@ class HulcDataModule(pl.LightningDataModule):
         num_workers: int = 8,
         transforms: DictConfig = DEFAULT_TRANSFORM,
         shuffle_val: bool = False,
+        use_skill_id: bool = False,
+        task_index_json: str = "",
         **kwargs: Dict,
     ):
         super().__init__()
@@ -46,6 +48,9 @@ class HulcDataModule(pl.LightningDataModule):
         self.modalities: List[str] = []
         self.transforms = transforms
         self.use_shm = False
+        # skill-id injection options
+        self.use_skill_id = use_skill_id
+        self.task_index_json = task_index_json
 
         #if 'lang_dataset' in self.datasets_cfg:
         #    if "shm_dataset" in self.datasets_cfg.lang_dataset._target_:
@@ -123,9 +128,19 @@ class HulcDataModule(pl.LightningDataModule):
                 continue
             else:
                 train_dataset = hydra.utils.instantiate(
-                    dataset, datasets_dir=self.training_dir, transforms=self.train_transforms
+                    dataset,
+                    datasets_dir=self.training_dir,
+                    transforms=self.train_transforms,
+                    use_skill_id=self.use_skill_id,
+                    task_index_json=self.task_index_json,
                 )
-                val_dataset = hydra.utils.instantiate(dataset, datasets_dir=self.val_dir, transforms=self.val_transforms)
+                val_dataset = hydra.utils.instantiate(
+                    dataset,
+                    datasets_dir=self.val_dir,
+                    transforms=self.val_transforms,
+                    use_skill_id=self.use_skill_id,
+                    task_index_json=self.task_index_json,
+                )
                 # if self.use_shm:
                 #     train_dataset.setup_shm_lookup(train_shm_lookup)
                 #     val_dataset.setup_shm_lookup(val_shm_lookup)
@@ -157,4 +172,3 @@ class HulcDataModule(pl.LightningDataModule):
             )
             for key, dataset in self.val_datasets.items()
         }
-
