@@ -82,6 +82,13 @@ class KMeansManager:
             h, idx = extract_fn(batch)
             if h is None or idx is None:
                 continue
+            try:
+                if (~torch.isfinite(h)).any():
+                    n_nan = torch.isnan(h).sum().item()
+                    n_inf = torch.isinf(h).sum().item()
+                    logger.warning(f"KMeans.extract_features: batch has non-finite h: nan={n_nan} inf={n_inf} shape={tuple(h.shape)}")
+            except Exception:
+                pass
             feats_list.append(h.to(device))
             idx_list.append(idx.to(device).long())
         if not feats_list:

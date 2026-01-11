@@ -189,9 +189,8 @@ def train(cfg: DictConfig) -> None:
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
                 # Reduce loss history over all processes:
-                avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                # avg_loss = avg_loss.item() / accelerator.num_processes # why divide?
-                avg_loss = avg_loss.item()
+                avg_loss = (running_loss / log_steps)
+                avg_loss = avg_loss.detach().item() if torch.is_tensor(avg_loss) else float(avg_loss)
                 # component avgs
                 avg_action = running_action / max(1, log_steps)
                 avg_contra = running_contra / max(1, log_steps)

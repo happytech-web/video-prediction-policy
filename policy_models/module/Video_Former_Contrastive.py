@@ -1,5 +1,7 @@
 # This code is referenced from https://github.com/dhansmair/flamingo-mini
 
+import logging
+
 import torch
 from einops import rearrange, repeat
 from einops_exts import rearrange_many
@@ -9,6 +11,7 @@ from torch.nn.modules import loss
 
 from policy_models.module.transformers.utils import feed_forward_layer
 
+logger = logging.getLogger(__name__)
 
 class Attention(nn.Module):
     def __init__(
@@ -366,6 +369,14 @@ class Video_Former_3D(nn.Module):
             Resampler features of shape (batch_size, num_queries, d_visual)
         """
         assert x_f.ndim == 4
+        # log inputs if non-finite
+        try:
+            if (~torch.isfinite(x_f)).any():
+                n_nan = torch.isnan(x_f).sum().item()
+                n_inf = torch.isinf(x_f).sum().item()
+                logger.warning(f"Video_Former_3D.forward: non-finite input x_f: nan={n_nan} inf={n_inf} shape={tuple(x_f.shape)}")
+        except Exception:
+            pass
 
         batch_size, max_length, _, dim = x_f.shape
 
@@ -434,6 +445,18 @@ class Video_Former_3D(nn.Module):
             h = self.cls_reduce(cls_flat)  # (B, D)
 
         # Return only tokens and h; losses are computed outside
+        try:
+            if (~torch.isfinite(tokens)).any() or (h is not None and (~torch.isfinite(h)).any()):
+                n_nan_tok = torch.isnan(tokens).sum().item()
+                n_inf_tok = torch.isinf(tokens).sum().item()
+                msg = f"Video_Former_3D.forward: non-finite output tokens: nan={n_nan_tok} inf={n_inf_tok} shape={tuple(tokens.shape)}"
+                if h is not None:
+                    n_nan_h = torch.isnan(h).sum().item()
+                    n_inf_h = torch.isinf(h).sum().item()
+                    msg += f"; h: nan={n_nan_h} inf={n_inf_h} shape={tuple(h.shape)}"
+                logger.warning(msg)
+        except Exception:
+            pass
         return tokens, h
 
 

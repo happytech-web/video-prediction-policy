@@ -220,6 +220,21 @@ class VPP_Policy(pl.LightningModule):
         self._last_proto_loss = 0.0
         self._last_metric_loss = 0.0
 
+    def _log_if_nonfinite(self, tag: str, t: torch.Tensor):
+        try:
+            if not torch.is_tensor(t):
+                return
+            if t.numel() == 0:
+                return
+            nonfinite = ~torch.isfinite(t)
+            if nonfinite.any():
+                n_nan = torch.isnan(t).sum().item()
+                n_inf = torch.isinf(t).sum().item()
+                max_abs = t.detach().abs().max().item()
+                logger.warning(f"Non-finite detected at {tag}: shape={tuple(t.shape)} nan={n_nan} inf={n_inf} max_abs={max_abs:.4e}")
+        except Exception:
+            pass
+
     def process_device(self):
         self.TVP_encoder.pipeline = self.TVP_encoder.pipeline.to(self.device)
         self.TVP_encoder.text_encoder = self.TVP_encoder.text_encoder.to(self.device)
@@ -403,10 +418,12 @@ class VPP_Policy(pl.LightningModule):
             perceptual_features = self.TVP_encoder(input_rgb, language, self.timestep,
                                                            self.extract_layer_idx, all_layer=self.use_all_layer,
                                                            step_time=1, max_length=self.max_length)
+            self._log_if_nonfinite("TVP_encoder.output", perceptual_features)
 
         perceptual_features = einops.rearrange(perceptual_features, 'b f c h w-> b f c (h w)')
         perceptual_features = einops.rearrange(perceptual_features, 'b f c l-> b f l c')
         perceptual_features = perceptual_features[:, :num_frames, :, :]
+        self._log_if_nonfinite("perceptual_features.rearranged", perceptual_features)
         #print('perceptual_features_shape:', perceptual_features.shape)
 
         perceptual_features, gripper_feature = torch.split(perceptual_features, [batch, batch], dim=0)
@@ -416,6 +433,9 @@ class VPP_Policy(pl.LightningModule):
         # Use contrastive Video Former (3D returns tokens and h)
         if self.use_Former == '3d':
             perceptual_tokens, h = self.Video_Former(perceptual_features)
+            self._log_if_nonfinite("Video_Former.tokens", perceptual_tokens)
+            if h is not None:
+                self._log_if_nonfinite("Video_Former.h", h)
         else:
             perceptual_tokens = self.Video_Former(perceptual_features)
             h = None
