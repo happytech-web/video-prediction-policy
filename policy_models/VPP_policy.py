@@ -78,6 +78,10 @@ class VPP_Policy(pl.LightningModule):
             kmeans_k: int = 50,
             kmeans_refresh_interval: int = 1,
             kmeans_loader_key: str = 'lang',
+            # Loss weights
+            lambda_contra: float = 1.0,
+            lambda_proto: float = 1.0,
+            lambda_metric: float = 1.0,
     ):
         super(VPP_Policy, self).__init__()
         self.latent_dim = latent_dim
@@ -206,6 +210,10 @@ class VPP_Policy(pl.LightningModule):
         self.kmeans_refresh_interval = kmeans_refresh_interval
         self.kmeans_loader_key = kmeans_loader_key
         self.kmeans_mgr = KMeansManager(n_clusters=self.kmeans_k, feature_dim=latent_dim) if self.use_kmeans else None
+        # loss weights
+        self.lambda_contra = float(lambda_contra)
+        self.lambda_proto = float(lambda_proto)
+        self.lambda_metric = float(lambda_metric)
         # last-step loss components for external logging
         self._last_action_loss = 0.0
         self._last_contra_loss = 0.0
@@ -300,12 +308,12 @@ class VPP_Policy(pl.LightningModule):
         if h is not None and self.contrastive_head is not None:
             if 'skill_id' in dataset_batch:
                 contra_loss = self.contrastive_head.loss_contra(h, dataset_batch['skill_id'])
-                pdcp_loss = pdcp_loss + contra_loss
+                pdcp_loss = pdcp_loss + self.lambda_contra * contra_loss
             # Use provided kmeans info if available in batch
             if 'centers_mu' in dataset_batch and 'cluster_id' in dataset_batch:
                 proto_loss = self.contrastive_head.loss_proto(h, dataset_batch['centers_mu'], dataset_batch['cluster_id'])
                 metric_loss = self.contrastive_head.loss_metric(h, dataset_batch['cluster_id'])
-                pdcp_loss = pdcp_loss + proto_loss + metric_loss
+                pdcp_loss = pdcp_loss + self.lambda_proto * proto_loss + self.lambda_metric * metric_loss
             # Otherwise, consume from KMeansManager if ready
             elif self.use_kmeans and self.kmeans_mgr is not None and self.kmeans_mgr.ready():
                 if 'idx' in dataset_batch:
@@ -317,14 +325,14 @@ class VPP_Policy(pl.LightningModule):
                     if cluster_id is not None and centers_mu is not None:
                         proto_loss = self.contrastive_head.loss_proto(h, centers_mu.to(h.device), cluster_id)
                         metric_loss = self.contrastive_head.loss_metric(h, cluster_id)
-                        pdcp_loss = pdcp_loss + proto_loss + metric_loss
+                        pdcp_loss = pdcp_loss + self.lambda_proto * proto_loss + self.lambda_metric * metric_loss
         total_loss += pdcp_loss
 
         # cache components for external logging
         self._last_action_loss = float(action_loss.detach().item())
-        self._last_contra_loss = float(contra_loss.detach().item()) if torch.is_tensor(contra_loss) else 0.0
-        self._last_proto_loss = float(proto_loss.detach().item()) if torch.is_tensor(proto_loss) else 0.0
-        self._last_metric_loss = float(metric_loss.detach().item()) if torch.is_tensor(metric_loss) else 0.0
+        self._last_contra_loss = float((self.lambda_contra * contra_loss).detach().item()) if torch.is_tensor(contra_loss) else 0.0
+        self._last_proto_loss = float((self.lambda_proto * proto_loss).detach().item()) if torch.is_tensor(proto_loss) else 0.0
+        self._last_metric_loss = float((self.lambda_metric * metric_loss).detach().item()) if torch.is_tensor(metric_loss) else 0.0
 
         total_bs = dataset_batch["actions"].shape[0]
 

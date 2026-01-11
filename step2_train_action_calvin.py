@@ -298,10 +298,14 @@ if __name__ == "__main__":
     parser.add_argument("--kmeans_k", type=int, default=50, help="Number of K-Means clusters")
     parser.add_argument("--kmeans_refresh_interval", type=int, default=1, help="Epoch interval to refresh K-Means over full dataset")
     parser.add_argument("--kmeans_loader_key", type=str, default="lang", help="Which train loader key to use for K-Means feature extraction")
-    
+    # Loss weight options
+    parser.add_argument("--lambda_contra", type=float, default=None, help="Weight for contrastive loss")
+    parser.add_argument("--lambda_proto", type=float, default=None, help="Weight for prototype loss")
+    parser.add_argument("--lambda_metric", type=float, default=None, help="Weight for metric loss")
+
     args = parser.parse_args()
     from hydra import compose, initialize
-    
+
     with initialize(config_path="./policy_conf", job_name="VPP_Calvinabc_train"):
         cfg = compose(config_name="VPP_Calvinabc_train")
     if args.video_model_path:
@@ -328,4 +332,11 @@ if __name__ == "__main__":
     cfg.model.kmeans_k = int(args.kmeans_k)
     cfg.model.kmeans_refresh_interval = int(args.kmeans_refresh_interval)
     cfg.model.kmeans_loader_key = str(args.kmeans_loader_key)
+    # Loss weights from CLI (keep defaults if None)
+    if args.lambda_contra is not None:
+        cfg.model.lambda_contra = float(args.lambda_contra)
+    if args.lambda_proto is not None:
+        cfg.model.lambda_proto = float(args.lambda_proto)
+    if args.lambda_metric is not None:
+        cfg.model.lambda_metric = float(args.lambda_metric)
     train(cfg)

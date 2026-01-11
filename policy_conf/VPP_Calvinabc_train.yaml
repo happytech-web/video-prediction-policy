@@ -65,6 +65,10 @@ model:
   kmeans_k: 50
   kmeans_refresh_interval: 1
   kmeans_loader_key: lang
+  # Loss weights
+  lambda_contra: 1.0
+  lambda_proto: 1.0
+  lambda_metric: 1.0
   optimizer:
     _target_: torch.optim.AdamW
     transformer_weight_decay: 0.05
