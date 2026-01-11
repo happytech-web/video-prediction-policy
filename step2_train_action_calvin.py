@@ -219,6 +219,17 @@ def train(cfg: DictConfig) -> None:
                 total_val_loss += val_loss["validation_loss"]
                 log_steps += 1
             model.train()
+        # Run KMeans update at epoch end across all ranks to gather distributed features
+        if cfg.model.use_kmeans and ((epoch + 1) % cfg.model.kmeans_refresh_interval == 0):
+            try:
+                _m = model.module if accelerator.num_processes > 1 else model
+                # use sharded training loader to ensure each rank processes its shard
+                if accelerator.is_main_process:
+                    logger.info("Running KMeans full update over training loader shard...")
+                _m.run_kmeans_with_loader(loader)
+            except Exception as ex:
+                if accelerator.is_main_process:
+                    logger.info(f"KMeans update skipped due to error: {ex}")
         if accelerator.is_main_process:
             total_val_loss = total_val_loss/log_steps
             log_steps = 0

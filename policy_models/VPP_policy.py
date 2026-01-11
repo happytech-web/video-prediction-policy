@@ -794,6 +794,23 @@ class VPP_Policy(pl.LightningModule):
         centers = self.kmeans_mgr.get_centers()
         logger.info(f"KMeans: updated centers shape={None if centers is None else tuple(centers.shape)} in {t1-t0:.2f}s")
 
+    @torch.no_grad()
+    def run_kmeans_with_loader(self, loader):
+        """Run KMeans update using a provided dataloader (works without Lightning Trainer)."""
+        if not self.use_kmeans or self.kmeans_mgr is None:
+            return
+        device = self.device if hasattr(self, 'device') else next(self.parameters()).device
+        import time as _time
+        t0 = _time.time()
+        feats_all, idx_all = self.kmeans_mgr.extract_features(self, loader, device, self._extract_h_from_batch)
+        if feats_all.numel() == 0:
+            return
+        logger.info(f"KMeans: collected features {tuple(feats_all.shape)} with indices {tuple(idx_all.shape)} (external loader)")
+        self.kmeans_mgr.update(feats_all, idx_all)
+        t1 = _time.time()
+        centers = self.kmeans_mgr.get_centers()
+        logger.info(f"KMeans: updated centers shape={None if centers is None else tuple(centers.shape)} in {t1-t0:.2f}s (external loader)")
+
 
 @rank_zero_only
 def log_rank_0(*args, **kwargs):
