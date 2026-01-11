@@ -112,9 +112,19 @@ class KMeansManager:
             mat.train(x_np)
             assert mat.is_trained
             x_np = mat.apply_py(x_np)
+            # log non-finite after PCA whitening
+            if not np.isfinite(x_np).all():
+                n_nan = int(np.isnan(x_np).sum())
+                n_inf = int(np.isinf(x_np).sum())
+                logger.warning(f"KMeans._preprocess_features_faiss: non-finite after PCA apply: nan={n_nan} inf={n_inf}, shape={x_np.shape}")
         # L2 normalize rows
         norms = np.linalg.norm(x_np, axis=1, keepdims=True) + 1e-12
         x_np = x_np / norms
+        # log non-finite after L2 norm
+        if not np.isfinite(x_np).all():
+            n_nan = int(np.isnan(x_np).sum())
+            n_inf = int(np.isinf(x_np).sum())
+            logger.warning(f"KMeans._preprocess_features_faiss: non-finite after L2 norm: nan={n_nan} inf={n_inf}, shape={x_np.shape}")
         return x_np
 
     def _kmeans_faiss(self, x_np: np.ndarray) -> np.ndarray:
@@ -194,6 +204,14 @@ class KMeansManager:
         """Run kmeans on rank0, return (assignments[N], centers[K,D])."""
         # normalize to unit length (pre-FAISS PCA+L2 also normalizes internally)
         x_n = torch.nn.functional.normalize(x, dim=1)
+        # log non-finite before handing to FAISS/torch backend
+        try:
+            if (~torch.isfinite(x_n)).any():
+                n_nan = int(torch.isnan(x_n).sum().item())
+                n_inf = int(torch.isinf(x_n).sum().item())
+                logger.warning(f"KMeans.run_kmeans: non-finite input to backend: nan={n_nan} inf={n_inf} shape={tuple(x_n.shape)}")
+        except Exception:
+            pass
         if dist.is_available() and dist.is_initialized():
             rank = dist.get_rank()
         else:
