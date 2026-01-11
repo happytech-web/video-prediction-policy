@@ -101,14 +101,16 @@ class KMeansManager:
 
     def _preprocess_features_faiss(self, x_np: np.ndarray) -> np.ndarray:
         """
-        Mirror SPCL preprocessing: PCA (whiten) to pca_dim, then L2 normalize.
+        PCA to pca_dim with rotation only (no whitening), then L2 normalize.
+        This avoids amplifying near-zero eigenvalues that can cause NaN/Inf.
         """
         faiss = _import_faiss()
         n, d = x_np.shape
         x_np = x_np.astype("float32")
         out_dim = min(self.pca_dim, d)
         if out_dim > 0 and out_dim < d:
-            mat = faiss.PCAMatrix(d, out_dim, eigen_power=-0.5)
+            # rotation-only PCA (eigen_power=0.0) to avoid whitening blow-ups
+            mat = faiss.PCAMatrix(d, out_dim, eigen_power=0.0)
             mat.train(x_np)
             assert mat.is_trained
             x_np = mat.apply_py(x_np)
@@ -116,7 +118,7 @@ class KMeansManager:
             if not np.isfinite(x_np).all():
                 n_nan = int(np.isnan(x_np).sum())
                 n_inf = int(np.isinf(x_np).sum())
-                logger.warning(f"KMeans._preprocess_features_faiss: non-finite after PCA apply: nan={n_nan} inf={n_inf}, shape={x_np.shape}")
+                logger.warning(f"KMeans._preprocess_features_faiss: non-finite after PCA (rotation) apply: nan={n_nan} inf={n_inf}, shape={x_np.shape}")
         # L2 normalize rows
         norms = np.linalg.norm(x_np, axis=1, keepdims=True) + 1e-12
         x_np = x_np / norms
