@@ -7,7 +7,8 @@ accelerate launch step2_train_action_calvin.py \
         --use_kmeans \
         --kmeans_k 30 \
         --kmeans_refresh_interval 1 \
-        --lambda_contra 0.1 --lambda_proto 0.1 --lambda_metric 0.1
+        --lambda_contra 0.1 --lambda_proto 0.1 --lambda_metric 0.1 \
+        --use_wandb --wandb_project calvin_abcd
 
 
 #   --lang_folder lang_paraphrase-MiniLM-L3-v2
