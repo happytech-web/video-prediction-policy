@@ -174,7 +174,7 @@ class VPP_Policy(pl.LightningModule):
                                 device=self.device,
                                 sigma_data=0.5).to(self.device)
 
-        # optional contrastive head (decoupled from Video Former to follow LoD)
+        # optional contrastive head
         self.contrastive_head = ContrastiveHead(dim=latent_dim)
 
         self.optimizer_config = optimizer

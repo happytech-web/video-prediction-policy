@@ -53,7 +53,6 @@ class ContrastiveHead(nn.Module):
     ) -> torch.Tensor:
         """
         SPCL (SimCLR-style) NT-Xent loss with two views per sample (no labels required).
-        Matches ref/SPCL/model/losses.py::SPCLCriterion.
         """
         T = self.tau_contra if temperature is None else temperature
         if normalize:
