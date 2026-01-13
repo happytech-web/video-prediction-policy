@@ -76,7 +76,7 @@ def create_logger(logging_dir):
 
 
 #@hydra.main(config_path="./policy_conf", config_name="VPP_Calvinabc_train")
-def train(cfg: DictConfig) -> None:
+def train(cfg: DictConfig, wandb_opts: dict | None = None) -> None:
     os.environ['HYDRA_FULL_ERROR'] = '1'
     # Enable DDP to tolerate legitimately unused parameters (e.g., optional heads)
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -102,15 +102,14 @@ def train(cfg: DictConfig) -> None:
         logger.info(f"Training with the following config:\n{OmegaConf.to_yaml(cfg)}")
         # Initialize Weights & Biases if requested
         try:
-            if getattr(cfg, "_use_wandb", False):
-                # Resolve project/group/name from CLI overrides or config
+            wb = wandb_opts or {}
+            use_wandb = bool(wb.get("use", False))
+            if use_wandb:
                 cfg_d = OmegaConf.to_container(cfg, resolve=True)
-                project = cfg_d.get("_wandb_project") or (
-                    (cfg_d.get("logger", {}) or {}).get("project") or cfg_d.get("benchmark_name") or "vpp"
-                )
-                group = cfg_d.get("_wandb_group") or (cfg_d.get("logger", {}) or {}).get("group") or "models"
-                name = cfg_d.get("_wandb_name") or f"calvin_step2_{uuid}"
-                mode = cfg_d.get("_wandb_mode") or "online"
+                project = wb.get("project") or ((cfg_d.get("logger", {}) or {}).get("project") or cfg_d.get("benchmark_name") or "vpp")
+                group = wb.get("group") or ((cfg_d.get("logger", {}) or {}).get("group") or "models")
+                name = wb.get("name") or f"calvin_step2_{uuid}"
+                mode = wb.get("mode") or "online"
                 if mode == "offline":
                     os.environ["WANDB_MODE"] = "offline"
                 elif mode == "disabled":
@@ -221,7 +220,7 @@ def train(cfg: DictConfig) -> None:
                     logger.info(
                         f"(step={train_steps:07d}) Train Loss total={avg_loss:.6f} | action={avg_action:.6f} contra={avg_contra:.6f} proto={avg_proto:.6f} metric={avg_metric:.6f} | {steps_per_sec:.2f} steps/s")
                     # wandb logging (main process only)
-                    if getattr(cfg, "_use_wandb", False) and wandb.run is not None:
+                    if (wandb_opts or {}).get("use", False) and wandb.run is not None:
                         wandb.log({
                             "train/total_loss": avg_loss,
                             "train/action_loss": avg_action,
@@ -265,7 +264,7 @@ def train(cfg: DictConfig) -> None:
             total_val_loss = total_val_loss/log_steps
             log_steps = 0
             # wandb validation logging
-            if getattr(cfg, "_use_wandb", False) and wandb.run is not None:
+            if (wandb_opts or {}).get("use", False) and wandb.run is not None:
                 wandb.log({
                     "val/total_loss": float(total_val_loss),
                     "epoch": epoch,
@@ -284,7 +283,7 @@ def train(cfg: DictConfig) -> None:
                 torch.save(checkpoint, checkpoint_path)
                 logger.info(f"Saved checkpoint to {checkpoint_path}")
                 best_eval_loss = total_val_loss
-                if getattr(cfg, "_use_wandb", False) and wandb.run is not None:
+                if (wandb_opts or {}).get("use", False) and wandb.run is not None:
                     wandb.summary["best_val_loss"] = float(best_eval_loss)
                     wandb.summary["best_ckpt_path"] = checkpoint_path
             last_path = f"{checkpoint_dir}/last.pt"
@@ -386,10 +385,12 @@ if __name__ == "__main__":
         cfg.model.lambda_proto = float(args.lambda_proto)
     if args.lambda_metric is not None:
         cfg.model.lambda_metric = float(args.lambda_metric)
-    # wandb flags (store in cfg for access in training loop)
-    cfg._use_wandb = bool(args.use_wandb)
-    cfg._wandb_project = str(args.wandb_project) if args.wandb_project else None
-    cfg._wandb_group = str(args.wandb_group) if args.wandb_group else None
-    cfg._wandb_name = str(args.wandb_name) if args.wandb_name else None
-    cfg._wandb_mode = str(args.wandb_mode) if args.wandb_mode else "online"
-    train(cfg)
+    # Build wandb options without touching the structured cfg
+    wandb_opts = {
+        "use": bool(args.use_wandb),
+        "project": args.wandb_project or None,
+        "group": args.wandb_group or None,
+        "name": args.wandb_name or None,
+        "mode": args.wandb_mode or "online",
+    }
+    train(cfg, wandb_opts)
