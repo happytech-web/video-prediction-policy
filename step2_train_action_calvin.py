@@ -372,6 +372,12 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_contra", type=float, default=None, help="Weight for contrastive loss")
     parser.add_argument("--lambda_proto", type=float, default=None, help="Weight for prototype loss")
     parser.add_argument("--lambda_metric", type=float, default=None, help="Weight for metric loss")
+    # Grouped sampling options
+    parser.add_argument("--enable_grouped_sampling", action="store_true", help="Enable grouped no-replacement sampling by skill_id for lang loader")
+    parser.add_argument("--min_per_skill", type=int, default=None, help="Minimum samples per selected skill in a batch (default=2)")
+    parser.add_argument("--max_skills_per_batch", type=int, default=None, help="Max number of distinct skills per batch (default derives from batch_size // min_per_skill)")
+    parser.add_argument("--drop_last_grouped", action="store_true", help="Drop last incomplete batch when using grouped sampling")
+    parser.add_argument("--grouped_seed", type=int, default=None, help="Seed for grouped sampler shuffling")
     # Weights & Biases options
     parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb_project", type=str, default="", help="Wandb project name override")
@@ -419,6 +425,22 @@ if __name__ == "__main__":
         cfg.model.lambda_proto = float(args.lambda_proto)
     if args.lambda_metric is not None:
         cfg.model.lambda_metric = float(args.lambda_metric)
+    # Grouped sampling overrides from CLI
+    if args.enable_grouped_sampling:
+        if not hasattr(cfg.datamodule, 'grouped_sampling') or cfg.datamodule.grouped_sampling is None:
+            cfg.datamodule.grouped_sampling = {}
+        cfg.datamodule.grouped_sampling.enabled = True
+        # Ensure skill ids are produced by dataset
+        if not hasattr(cfg.datamodule, 'use_skill_id') or not cfg.datamodule.use_skill_id:
+            cfg.datamodule.use_skill_id = True
+        if args.min_per_skill is not None:
+            cfg.datamodule.grouped_sampling.min_per_skill = int(args.min_per_skill)
+        if args.max_skills_per_batch is not None:
+            cfg.datamodule.grouped_sampling.max_skills_per_batch = int(args.max_skills_per_batch)
+        if args.drop_last_grouped:
+            cfg.datamodule.grouped_sampling.drop_last = True
+        if args.grouped_seed is not None:
+            cfg.datamodule.grouped_sampling.seed = int(args.grouped_seed)
     # Build wandb options without touching the structured cfg
     wandb_opts = {
         "use": bool(args.use_wandb),
