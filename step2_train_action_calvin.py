@@ -354,6 +354,10 @@ if __name__ == "__main__":
 
     with initialize(config_path="./policy_conf", job_name="VPP_Calvinabc_train"):
         cfg = compose(config_name="VPP_Calvinabc_train")
+    # Validate task index json path if provided
+    if args.task_index_json and not os.path.isfile(args.task_index_json):
+        print(f"[warn] task_index_json not found: {args.task_index_json}. Disabling skill-id injection.")
+        args.task_index_json = ""
     if args.video_model_path:
         cfg.model.pretrained_model_path = args.video_model_path
     if args.text_encoder_path:

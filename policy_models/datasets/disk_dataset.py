@@ -197,8 +197,11 @@ class ExtendedDiskDataset(DiskDataset):
                         e = int(ann.get("end"))
                         tid = int(ann.get("task_id", -1))
                         intervals.append((s, e, tid))
-                self._skill_intervals = intervals if len(intervals) > 0 else None
-                logger.info(f"Loaded {len(self._skill_intervals)} skill intervals for split={split} from {self.task_index_json}")
+                n_intervals = len(intervals)
+                self._skill_intervals = intervals if n_intervals > 0 else None
+                logger.info(
+                    f"Loaded {n_intervals} skill intervals for split={split} from {self.task_index_json}"
+                )
             except Exception as ex:
                 logger.warning(f"Failed to load task_index_json={self.task_index_json}: {ex}")
                 self._skill_intervals = None
