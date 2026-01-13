@@ -126,6 +126,15 @@ def train(cfg: DictConfig, wandb_opts: dict | None = None) -> None:
         logger.info(f"Global batch size {cfg.batch_size:,} num_processes ({accelerator.num_processes})")
     chk = get_last_checkpoint(Path.cwd())
     train_loader = datamodule.train_dataloader()["lang"]
+    # keep a handle to the underlying batch_sampler if it supports set_epoch
+    batch_sampler_ref = getattr(train_loader, 'batch_sampler', None)
+    if hasattr(batch_sampler_ref, 'set_epoch'):
+        try:
+            batch_sampler_ref.set_epoch(0)
+            if accelerator.is_main_process:
+                logger.info("Initialized grouped sampler for epoch 0")
+        except Exception:
+            pass
     test_loader = datamodule.val_dataloader()["lang"]
     # chk = get_last_checkpoint(Path('/home/temp_store/code/calvin_d/logs/runs/2023-09-10/17-52-50/saved_models/epoch=09_eval_lh/avg_seq_len=2.62.ckpt'))
     # Load Model
@@ -179,6 +188,27 @@ def train(cfg: DictConfig, wandb_opts: dict | None = None) -> None:
         logger.info(f"Training for {cfg.max_epochs} epochs...")
 
     for epoch in range(cfg.max_epochs):
+        # set epoch for custom grouped sampler to reshuffle without replacement
+        if hasattr(batch_sampler_ref, 'set_epoch'):
+            try:
+                batch_sampler_ref.set_epoch(epoch)
+            except Exception:
+                pass
+        # log one probe batch's skill distribution at epoch start (main process only)
+        if accelerator.is_main_process:
+            try:
+                probe_iter = iter(loader)
+                probe_batch = next(probe_iter)
+                if isinstance(probe_batch, dict) and ('skill_id' in probe_batch):
+                    sid = probe_batch['skill_id']
+                    if hasattr(sid, 'detach'):
+                        sid = sid.detach().cpu().view(-1)
+                    # compute counts per skill in this batch
+                    unique, counts = torch.unique(sid, return_counts=True)
+                    pairs = sorted(zip(unique.tolist(), counts.tolist()), key=lambda x: -x[1])
+                    logger.info(f"Epoch {epoch} probe batch skill counts: " + ", ".join([f"{k}:{v}" for k, v in pairs]))
+            except Exception:
+                pass
         if accelerator.is_main_process:
             logger.info(f"Beginning epoch {epoch}...")
         running_loss = 0

@@ -14,6 +14,10 @@ import pytorch_lightning as pl
 import policy_models
 from policy_models.datasets.utils.episode_utils import load_dataset_statistics
 from policy_models.datasets.utils.shared_memory_utils import load_shm_lookup, save_shm_lookup, SharedMemoryLoader
+from policy_models.datasets.samplers import (
+    GroupedNoReplacementBatchSampler,
+    build_skill_buckets_from_dataset,
+)
 
 logger = logging.getLogger(__name__)
 DEFAULT_TRANSFORM = OmegaConf.create({"train": None, "val": None})
@@ -30,6 +34,7 @@ class HulcDataModule(pl.LightningDataModule):
         shuffle_val: bool = False,
         use_skill_id: bool = False,
         task_index_json: str = "",
+        grouped_sampling: DictConfig = None,
         **kwargs: Dict,
     ):
         super().__init__()
@@ -51,6 +56,8 @@ class HulcDataModule(pl.LightningDataModule):
         # skill-id injection options
         self.use_skill_id = use_skill_id
         self.task_index_json = task_index_json
+        # grouped sampling config (optional)
+        self.grouped_sampling = grouped_sampling
 
         #if 'lang_dataset' in self.datasets_cfg:
         #    if "shm_dataset" in self.datasets_cfg.lang_dataset._target_:
@@ -150,17 +157,52 @@ class HulcDataModule(pl.LightningDataModule):
                 self.modalities.append(key)
 
     def train_dataloader(self):
-        return {
-            key: DataLoader(
-                dataset,
-                batch_size=dataset.batch_size,
+        loaders = {}
+        for key, dataset in self.train_datasets.items():
+            # default args
+            dl_kwargs = dict(
                 num_workers=dataset.num_workers,
                 pin_memory=True,
-                shuffle=True,
                 prefetch_factor=2,
             )
-            for key, dataset in self.train_datasets.items()
-        }
+            use_grouped = False
+            if (
+                key == "lang"
+                and bool(self.use_skill_id)
+                and self.grouped_sampling is not None
+                and bool(self.grouped_sampling.get("enabled", False))
+            ):
+                # build buckets from dataset metadata
+                buckets = build_skill_buckets_from_dataset(dataset)
+                if len(buckets) > 0:
+                    min_per_skill = int(self.grouped_sampling.get("min_per_skill", 2))
+                    max_skills = self.grouped_sampling.get("max_skills_per_batch", None)
+                    if max_skills is not None:
+                        max_skills = int(max_skills)
+                    drop_last = bool(self.grouped_sampling.get("drop_last", False))
+                    seed = int(self.grouped_sampling.get("seed", 1234))
+                    batch_sampler = GroupedNoReplacementBatchSampler(
+                        buckets=buckets,
+                        batch_size=dataset.batch_size,
+                        min_per_skill=min_per_skill,
+                        max_skills_per_batch=max_skills,
+                        drop_last=drop_last,
+                        seed=seed,
+                    )
+                    loaders[key] = DataLoader(
+                        dataset,
+                        batch_sampler=batch_sampler,
+                        **dl_kwargs,
+                    )
+                    use_grouped = True
+            if not use_grouped:
+                loaders[key] = DataLoader(
+                    dataset,
+                    batch_size=dataset.batch_size,
+                    shuffle=True,
+                    **dl_kwargs,
+                )
+        return loaders
 
     def val_dataloader(self):
         return {

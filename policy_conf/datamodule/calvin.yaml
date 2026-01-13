@@ -3,6 +3,12 @@ _recursive_: false
 
 use_skill_id: false
 task_index_json: ""
+grouped_sampling:
+  enabled: false
+  min_per_skill: 2
+  max_skills_per_batch: null  # null -> derive as batch_size // min_per_skill
+  drop_last: false
+  seed: 1234
 
 datasets:
   lang_dataset:
