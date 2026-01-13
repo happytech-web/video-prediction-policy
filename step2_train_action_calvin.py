@@ -100,6 +100,26 @@ def train(cfg: DictConfig) -> None:
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
         logger.info(f"Training with the following config:\n{OmegaConf.to_yaml(cfg)}")
+        # Initialize Weights & Biases if requested
+        try:
+            if getattr(cfg, "_use_wandb", False):
+                # Resolve project/group/name from CLI overrides or config
+                cfg_d = OmegaConf.to_container(cfg, resolve=True)
+                project = cfg_d.get("_wandb_project") or (
+                    (cfg_d.get("logger", {}) or {}).get("project") or cfg_d.get("benchmark_name") or "vpp"
+                )
+                group = cfg_d.get("_wandb_group") or (cfg_d.get("logger", {}) or {}).get("group") or "models"
+                name = cfg_d.get("_wandb_name") or f"calvin_step2_{uuid}"
+                mode = cfg_d.get("_wandb_mode") or "online"
+                if mode == "offline":
+                    os.environ["WANDB_MODE"] = "offline"
+                elif mode == "disabled":
+                    os.environ["WANDB_DISABLED"] = "true"
+                wandb.init(project=project, group=group, name=name,
+                           config=cfg_d, dir=experiment_dir, reinit=True)
+                logger.info(f"Initialized Weights & Biases: project={project}, group={group}, name={name}, mode={mode}")
+        except Exception as ex:
+            logger.info(f"wandb init failed or disabled: {ex}")
 
     datamodule = hydra.utils.instantiate(cfg.datamodule)
     datamodule.setup()
@@ -200,6 +220,18 @@ def train(cfg: DictConfig) -> None:
                 if accelerator.is_main_process:
                     logger.info(
                         f"(step={train_steps:07d}) Train Loss total={avg_loss:.6f} | action={avg_action:.6f} contra={avg_contra:.6f} proto={avg_proto:.6f} metric={avg_metric:.6f} | {steps_per_sec:.2f} steps/s")
+                    # wandb logging (main process only)
+                    if getattr(cfg, "_use_wandb", False) and wandb.run is not None:
+                        wandb.log({
+                            "train/total_loss": avg_loss,
+                            "train/action_loss": avg_action,
+                            "train/contrastive_loss": avg_contra,
+                            "train/proto_loss": avg_proto,
+                            "train/metric_loss": avg_metric,
+                            "train/steps_per_sec": steps_per_sec,
+                            "epoch": epoch,
+                            "step": train_steps,
+                        }, step=train_steps)
                 # Reset monitoring variables:
                 running_loss = 0
                 running_action = 0.0
@@ -232,6 +264,13 @@ def train(cfg: DictConfig) -> None:
         if accelerator.is_main_process:
             total_val_loss = total_val_loss/log_steps
             log_steps = 0
+            # wandb validation logging
+            if getattr(cfg, "_use_wandb", False) and wandb.run is not None:
+                wandb.log({
+                    "val/total_loss": float(total_val_loss),
+                    "epoch": epoch,
+                    "step": train_steps,
+                }, step=train_steps)
             checkpoint = {
                 "model": model.module.state_dict() if accelerator.num_processes > 1 else model.state_dict(),
                 # "ema": ema.state_dict(),
@@ -245,6 +284,9 @@ def train(cfg: DictConfig) -> None:
                 torch.save(checkpoint, checkpoint_path)
                 logger.info(f"Saved checkpoint to {checkpoint_path}")
                 best_eval_loss = total_val_loss
+                if getattr(cfg, "_use_wandb", False) and wandb.run is not None:
+                    wandb.summary["best_val_loss"] = float(best_eval_loss)
+                    wandb.summary["best_ckpt_path"] = checkpoint_path
             last_path = f"{checkpoint_dir}/last.pt"
             torch.save(checkpoint, last_path)
 
@@ -301,6 +343,12 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_contra", type=float, default=None, help="Weight for contrastive loss")
     parser.add_argument("--lambda_proto", type=float, default=None, help="Weight for prototype loss")
     parser.add_argument("--lambda_metric", type=float, default=None, help="Weight for metric loss")
+    # Weights & Biases options
+    parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="", help="Wandb project name override")
+    parser.add_argument("--wandb_group", type=str, default="", help="Wandb group override")
+    parser.add_argument("--wandb_name", type=str, default="", help="Wandb run name override")
+    parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"], help="Wandb mode")
 
     args = parser.parse_args()
     from hydra import compose, initialize
@@ -338,4 +386,10 @@ if __name__ == "__main__":
         cfg.model.lambda_proto = float(args.lambda_proto)
     if args.lambda_metric is not None:
         cfg.model.lambda_metric = float(args.lambda_metric)
+    # wandb flags (store in cfg for access in training loop)
+    cfg._use_wandb = bool(args.use_wandb)
+    cfg._wandb_project = str(args.wandb_project) if args.wandb_project else None
+    cfg._wandb_group = str(args.wandb_group) if args.wandb_group else None
+    cfg._wandb_name = str(args.wandb_name) if args.wandb_name else None
+    cfg._wandb_mode = str(args.wandb_mode) if args.wandb_mode else "online"
     train(cfg)
