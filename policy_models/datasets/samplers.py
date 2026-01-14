@@ -50,7 +50,7 @@ class GroupedNoReplacementBatchSampler:
         self.seed = int(seed)
         self.epoch = 0
 
-        # distributed info (optional)
+        # distributed info (optional, logging only; do not slice here)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             self.world_size = torch.distributed.get_world_size()
             self.rank = torch.distributed.get_rank()
@@ -77,11 +77,9 @@ class GroupedNoReplacementBatchSampler:
     def __len__(self) -> int:
         total = sum(len(v) for v in self._orig_buckets.values())
         if self.drop_last:
-            full = total // self.batch_size
+            return total // self.batch_size
         else:
-            full = (total + self.batch_size - 1) // self.batch_size
-        # Return local length per-rank
-        return (full + self.world_size - 1) // self.world_size
+            return (total + self.batch_size - 1) // self.batch_size
 
     def __iter__(self) -> Iterator[List[int]]:
         # Create local copies and shuffle deterministically for this epoch
@@ -110,7 +108,7 @@ class GroupedNoReplacementBatchSampler:
         def remaining_skills() -> List[int]:
             return [k for k in skills if len(buckets[k]) > 0]
 
-        # global batch index for rank slicing
+        # global batch index for logging only
         global_batch_idx = 0
         seen_all = set()  # count coverage prior to rank slicing
         while True:
@@ -172,9 +170,8 @@ class GroupedNoReplacementBatchSampler:
                 # if dropping last incomplete batch, terminate
                 break
 
-            # distributed slicing: only yield batches assigned to this rank
-            if (global_batch_idx % self.world_size) == self.rank:
-                yield batch
+            # Do NOT slice by rank here; rely on external sharding (e.g., Accelerate) to split batches per-rank
+            yield batch
             global_batch_idx += 1
 
         # final coverage log (rank 0 only)
