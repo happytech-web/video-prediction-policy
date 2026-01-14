@@ -22,14 +22,40 @@ def _gather_cat_tensor(t: torch.Tensor) -> torch.Tensor:
     All-gather variable-length local tensor to all ranks and concatenate.
     Works for 1D or 2D tensors; gathers along dim 0.
     """
-    if not dist.is_available() or not dist.is_initialized():
+    # Diagnostics: DDP state
+    ddp_avail = dist.is_available()
+    ddp_init = dist.is_initialized() if ddp_avail else False
+    if not ddp_avail or not ddp_init:
+        try:
+            logger.warning(
+                f"KMeans._gather_cat_tensor: dist_available={ddp_avail} dist_initialized={ddp_init}; returning local only shape={tuple(t.shape)} device={t.device}"
+            )
+        except Exception:
+            pass
         return t
+    try:
+        backend = dist.get_backend()
+    except Exception:
+        backend = "unknown"
     world_size = dist.get_world_size()
+    rank = dist.get_rank()
     device = t.device
+    if rank == 0:
+        try:
+            logger.info(
+                f"KMeans._gather_cat_tensor: enter backend={backend} world={world_size} rank={rank} t_shape={tuple(t.shape)} dtype={t.dtype} device={device}"
+            )
+        except Exception:
+            pass
     local_len = torch.tensor([t.shape[0]], device=device, dtype=torch.long)
     lens = [torch.zeros_like(local_len) for _ in range(world_size)]
     dist.all_gather(lens, local_len)
     lens = torch.stack(lens).cpu().tolist()
+    if rank == 0:
+        try:
+            logger.info(f"KMeans._gather_cat_tensor: local_len={int(local_len.item())} gathered_lens={[int(x[0]) for x in lens]}")
+        except Exception:
+            pass
     max_len = int(max(l[0] for l in lens))
     pad = max_len - t.shape[0]
     if pad > 0:
@@ -46,7 +72,13 @@ def _gather_cat_tensor(t: torch.Tensor) -> torch.Tensor:
     chunks: List[torch.Tensor] = []
     for gi, ln in zip(gather_list, lens):
         chunks.append(gi[: ln[0]])
-    return torch.cat(chunks, dim=0)
+    out = torch.cat(chunks, dim=0)
+    if rank == 0:
+        try:
+            logger.info(f"KMeans._gather_cat_tensor: out_shape={tuple(out.shape)}")
+        except Exception:
+            pass
+    return out
 
 
 class KMeansManager:
