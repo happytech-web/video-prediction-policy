@@ -188,6 +188,8 @@ def train(cfg: DictConfig, wandb_opts: dict | None = None) -> None:
         logger.info(f"Training for {cfg.max_epochs} epochs...")
 
     for epoch in range(cfg.max_epochs):
+        # coverage tracker for current epoch (per-rank)
+        seen_idx_epoch = set()
         # set epoch for custom grouped sampler to reshuffle without replacement
         if hasattr(batch_sampler_ref, 'set_epoch'):
             try:
@@ -207,6 +209,13 @@ def train(cfg: DictConfig, wandb_opts: dict | None = None) -> None:
                     unique, counts = torch.unique(sid, return_counts=True)
                     pairs = sorted(zip(unique.tolist(), counts.tolist()), key=lambda x: -x[1])
                     logger.info(f"Epoch {epoch} probe batch skill counts: " + ", ".join([f"{k}:{v}" for k, v in pairs]))
+                # also log dataset length and world size
+                try:
+                    ds = datamodule.train_datasets.get('lang', None)
+                    if ds is not None:
+                        logger.info(f"Epoch {epoch} dataset_len={len(ds)} world_size={accelerator.num_processes}")
+                except Exception:
+                    pass
             except Exception:
                 pass
         if accelerator.is_main_process:
@@ -222,6 +231,23 @@ def train(cfg: DictConfig, wandb_opts: dict | None = None) -> None:
             Ir_scheduler.step()
             update_ema(ema, model)
             running_loss += loss
+            # track idx coverage for diagnostics
+            try:
+                batch_idx = data_batch.get('idx', None)
+                if batch_idx is not None:
+                    if hasattr(batch_idx, 'detach'):
+                        vals = batch_idx.detach().cpu().view(-1).tolist()
+                    elif isinstance(batch_idx, (list, tuple)):
+                        vals = list(batch_idx)
+                    else:
+                        vals = [int(batch_idx)]
+                    for _i in vals:
+                        try:
+                            seen_idx_epoch.add(int(_i))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             # collect component losses for logging
             try:
                 _m = model.module if accelerator.num_processes > 1 else model
@@ -290,6 +316,18 @@ def train(cfg: DictConfig, wandb_opts: dict | None = None) -> None:
             except Exception as ex:
                 if accelerator.is_main_process:
                     logger.info(f"KMeans update skipped due to error: {ex}")
+        # epoch coverage summary (per-rank)
+        try:
+            ds = datamodule.train_datasets.get('lang', None)
+            if ds is not None:
+                total_len = len(ds)
+                world = accelerator.num_processes
+                approx_per_rank = (total_len + world - 1) // world
+                logger.info(
+                    f"Epoch {epoch} coverage (rank-local): unique_seen={len(seen_idx_epoch)} approx_expected_per_rank={approx_per_rank} total_dataset_len={total_len}"
+                )
+        except Exception:
+            pass
         if accelerator.is_main_process:
             total_val_loss = total_val_loss/log_steps
             log_steps = 0

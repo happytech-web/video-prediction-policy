@@ -337,6 +337,16 @@ class VPP_Policy(pl.LightningModule):
                         idx = torch.as_tensor(idx, device=h.device)
                     cluster_id = self.kmeans_mgr.get_assignments(idx.to(h.device))
                     centers_mu = self.kmeans_mgr.get_centers()
+                    # log invalid label stats if any
+                    try:
+                        if cluster_id is not None and centers_mu is not None:
+                            K = int(centers_mu.shape[0])
+                            invalid = (cluster_id < 0) | (cluster_id >= K)
+                            n_invalid = int(invalid.sum().item())
+                            if n_invalid > 0:
+                                logger.warning(f"training_step: found {n_invalid} invalid kmeans labels (range [0,{K-1}]) in current batch")
+                    except Exception:
+                        pass
                     if cluster_id is not None and centers_mu is not None:
                         proto_loss = self.contrastive_head.loss_proto(h, centers_mu.to(h.device), cluster_id)
                         metric_loss = self.contrastive_head.loss_metric(h, cluster_id)
@@ -833,7 +843,22 @@ class VPP_Policy(pl.LightningModule):
         feats_all, idx_all = self.kmeans_mgr.extract_features(self, loader, device, self._extract_h_from_batch)
         if feats_all.numel() == 0:
             return
-        logger.info(f"KMeans: collected features {tuple(feats_all.shape)} with indices {tuple(idx_all.shape)} (external loader)")
+        # coverage diagnostics
+        try:
+            uniq = int(idx_all.unique().numel())
+            min_idx = int(idx_all.min().item())
+            max_idx = int(idx_all.max().item())
+            ds_len = None
+            try:
+                ds_len = int(len(getattr(loader, 'dataset', [])))
+            except Exception:
+                ds_len = None
+            cov_msg = f" uniq_idx={uniq} idx_range=[{min_idx},{max_idx}]"
+            if ds_len is not None:
+                cov_msg += f" dataset_len={ds_len}"
+        except Exception:
+            cov_msg = ""
+        logger.info(f"KMeans: collected features {tuple(feats_all.shape)} with indices {tuple(idx_all.shape)} (external loader){cov_msg}")
         self.kmeans_mgr.update(feats_all, idx_all)
         t1 = _time.time()
         centers = self.kmeans_mgr.get_centers()

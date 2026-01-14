@@ -175,6 +175,15 @@ class HulcDataModule(pl.LightningDataModule):
                 # build buckets from dataset metadata
                 buckets = build_skill_buckets_from_dataset(dataset)
                 if len(buckets) > 0:
+                    # log bucket stats for diagnostics
+                    try:
+                        total_items = sum(len(v) for v in buckets.values())
+                        uniq_items = len({i for vs in buckets.values() for i in vs})
+                        logger.info(
+                            f"Grouped sampling enabled on '{key}': skills={len(buckets)} total_items={total_items} unique_items={uniq_items} batch_size={dataset.batch_size}"
+                        )
+                    except Exception:
+                        pass
                     min_per_skill = int(self.grouped_sampling.get("min_per_skill", 2))
                     max_skills = self.grouped_sampling.get("max_skills_per_batch", None)
                     if max_skills is not None:

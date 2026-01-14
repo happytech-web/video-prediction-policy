@@ -256,6 +256,14 @@ class KMeansManager:
         """
         Update internal state given full-dataset features and corresponding dataset indices.
         """
+        try:
+            # basic coverage diagnostics before clustering
+            n_feat = int(features.shape[0])
+            n_uniq = int(indices.unique().numel()) if indices.numel() > 0 else 0
+            max_idx = int(indices.max().item()) + 1 if indices.numel() > 0 else 0
+            logger.info(f"KMeans.update: pre-stats feats={n_feat} uniq_idx={n_uniq} max_index_plus_1={max_idx}")
+        except Exception:
+            pass
         assign, centers = self.run_kmeans(features)
         # reorder to align by dataset index
         # features/indices are in arbitrary order; we build a global assignment array by max index+1
@@ -265,6 +273,16 @@ class KMeansManager:
         full_assign[indices] = assign
         self.assignments = full_assign.detach()
         self.centers_mu = centers.detach()
+        try:
+            # post-stats on assignment array
+            covered = int(indices.unique().numel())
+            logger.info(f"KMeans.update: built assignment array size={N_total} covered_positions={covered}")
+            if covered < N_total:
+                logger.warning(
+                    f"KMeans.update: uncovered positions detected: {N_total - covered} (these indices were not seen in feature extraction)"
+                )
+        except Exception:
+            pass
 
     def ready(self) -> bool:
         return self.assignments is not None and self.centers_mu is not None

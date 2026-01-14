@@ -1,8 +1,11 @@
 import random
+import logging
 from collections import deque, defaultdict
 from typing import Dict, Iterable, Iterator, List, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class GroupedNoReplacementBatchSampler:
@@ -55,6 +58,19 @@ class GroupedNoReplacementBatchSampler:
             self.world_size = 1
             self.rank = 0
 
+        # log bucket coverage and duplication at init
+        try:
+            all_items = [i for vs in self._orig_buckets.values() for i in vs]
+            uniq = set(all_items)
+            dup_cnt = len(all_items) - len(uniq)
+            logger.info(
+                f"GroupedSampler.init: skills={len(self._orig_buckets)} total_items={len(all_items)} unique_items={len(uniq)} duplicates={dup_cnt}"
+            )
+            if dup_cnt > 0 and (self.rank == 0):
+                logger.warning("GroupedSampler.init: duplicate indices found across buckets; check bucketization logic")
+        except Exception:
+            pass
+
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
@@ -79,12 +95,24 @@ class GroupedNoReplacementBatchSampler:
         skills = list(buckets.keys())
         rnd.shuffle(skills)
 
+        # logging header (rank 0 only to avoid spam)
+        if self.rank == 0:
+            try:
+                total_items = sum(len(v) for v in buckets.values())
+                uniq_items = len({i for vs in buckets.values() for i in vs})
+                logger.info(
+                    f"GroupedSampler.epoch={self.epoch} world={self.world_size} batch_size={self.batch_size} min_per_skill={self.min_per_skill} total_items={total_items} unique_items={uniq_items}"
+                )
+            except Exception:
+                pass
+
         # helper: count remaining
         def remaining_skills() -> List[int]:
             return [k for k in skills if len(buckets[k]) > 0]
 
         # global batch index for rank slicing
         global_batch_idx = 0
+        seen_all = set()  # count coverage prior to rank slicing
         while True:
             active = remaining_skills()
             if not active:
@@ -108,7 +136,9 @@ class GroupedNoReplacementBatchSampler:
             for k in chosen:
                 take = min(self.min_per_skill, len(buckets[k]))
                 for _ in range(take):
-                    batch.append(buckets[k].popleft())
+                    idx = buckets[k].popleft()
+                    batch.append(idx)
+                    seen_all.add(idx)
 
             # fill the remainder freely from any remaining indices (no replacement)
             if len(batch) < self.batch_size:
@@ -120,7 +150,9 @@ class GroupedNoReplacementBatchSampler:
                 while fill_needed > 0 and fill_skills:
                     k = fill_skills[fill_ptr]
                     if buckets[k]:
-                        batch.append(buckets[k].popleft())
+                        idx = buckets[k].popleft()
+                        batch.append(idx)
+                        seen_all.add(idx)
                         fill_needed -= 1
                         if not buckets[k]:
                             # drop exhausted skill for future rounds
@@ -144,6 +176,18 @@ class GroupedNoReplacementBatchSampler:
             if (global_batch_idx % self.world_size) == self.rank:
                 yield batch
             global_batch_idx += 1
+
+        # final coverage log (rank 0 only)
+        if self.rank == 0:
+            try:
+                uniq_items = len({i for vs in self._orig_buckets.values() for i in vs})
+                logger.info(
+                    f"GroupedSampler.coverage epoch={self.epoch}: seen={len(seen_all)} of unique_items={uniq_items} drop_last={self.drop_last}"
+                )
+                if len(seen_all) < uniq_items and not self.drop_last:
+                    logger.warning("GroupedSampler: not all items were scheduled into batches within epoch; investigate scheduling logic")
+            except Exception:
+                pass
 
 
 def build_skill_buckets_from_dataset(dataset) -> Dict[int, List[int]]:
@@ -170,4 +214,3 @@ def build_skill_buckets_from_dataset(dataset) -> Dict[int, List[int]]:
     # remove empty buckets
     buckets = {k: v for k, v in buckets.items() if len(v) > 0}
     return buckets
-
