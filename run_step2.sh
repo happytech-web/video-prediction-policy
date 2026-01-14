@@ -6,5 +6,6 @@ accelerate launch step2_train_action_calvin.py \
         --task_index_json ./calvin_task_index_debug.json \
         --use_kmeans \
         --kmeans_k 5 \
-        --kmeans_refresh_interval 2 \
-        --lambda_contra 0.1 --lambda_proto 0.05 --lambda_metric 0.05
+        --kmeans_refresh_interval 1 \
+        --lambda_contra 0.1 --lambda_proto 0.05 --lambda_metric 0.05 \
+        --enable_grouped_sampling
